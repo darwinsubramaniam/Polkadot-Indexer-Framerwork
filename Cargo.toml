@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# --- internal ---
+# The key is the short import name (`use pif_core::…`); `package` is what crates.io sees.
+# `version` is required alongside `path` or `cargo publish` rejects the dependency.
+pif-core = { path = "crates/pif-core", package = "polkadot-indexer-core", version = "1.0.0" }
+pif-db = { path = "crates/pif-db", package = "polkadot-indexer-db", version = "1.0.0" }
+pif-chain = { path = "crates/pif-chain", package = "polkadot-indexer-chain", version = "1.0.0" }
+pif-api = { path = "crates/pif-api", package = "polkadot-indexer-api", version = "1.0.0" }
+# Reference handler. Unpublished — downstream projects copy it rather than depend on it.
+pif-example-balances = { path = "crates/example" }
+
+# --- chain ---
+subxt = "0.50.3"
+subxt-signer = "0.50.3"
+scale-value = { version = "0.18.2", features = ["serde"] }
+parity-scale-codec = "3.7.5"
+
+# --- storage ---
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "macros",
+    "migrate",
+    "bigdecimal",
+    "chrono",
+    "json",
+] }
+bigdecimal = "0.4"
+
+# --- api ---
+async-graphql = { version = "7.2.1", features = ["dataloader", "chrono"] }
+async-graphql-axum = "7.2.1"
+axum = "0.8.9"
+tower-http = { version = "0.7.0", features = ["trace", "cors"] }
+
+# --- runtime / plumbing ---
+tokio = { version = "1.53.1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+hex = "0.4.3"

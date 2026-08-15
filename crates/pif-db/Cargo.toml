@@ -1,0 +1,27 @@
+[package]
+name = "polkadot-indexer-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Postgres persistence for the Polkadot Indexer Framework"
+repository = "https://github.com/darwinsubramaniam/polkadot-indexer-framework"
+homepage = "https://github.com/darwinsubramaniam/polkadot-indexer-framework"
+readme = "../../README.md"
+keywords = ["polkadot", "substrate", "indexer", "blockchain", "subxt"]
+categories = ["database", "command-line-utilities"]
+
+[lib]
+# Short import name: `use pif_db::…`. The published package name is longer for
+# discoverability on crates.io; Cargo allows the two to differ.
+name = "pif_db"
+
+[dependencies]
+pif-core.workspace = true
+
+sqlx.workspace = true
+bigdecimal.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

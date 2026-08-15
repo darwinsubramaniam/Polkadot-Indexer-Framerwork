@@ -1,0 +1,47 @@
+[package]
+name = "pif-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# NOTE: this crate deliberately does NOT depend on the `zombienet-sdk` crate.
+#
+# Two reasons:
+#   1. zombienet-sdk 0.4.x is unresolvable from crates.io — it pulls
+#      multihash 0.17 -> core2 ^0.4, and *every* published version of `core2`
+#      is yanked. Nothing in the 0.4 line can build.
+#   2. It depends on subxt ^0.44 while this workspace is on subxt 0.50. Those
+#      types are not interoperable.
+#
+# Instead we drive the prebuilt `zombie-cli` binary as a subprocess (native
+# aarch64-apple-darwin, see scripts/fetch-zombie-cli.sh) and read the node
+# endpoints out of the `zombie.json` state file it writes. The only thing
+# crossing the boundary is JSON, so there is no second subxt tree at all.
+
+[features]
+default = []
+# Mirrors the indexer-chain feature so the typed-overlay test can be enabled.
+handler-balances = ["dep:pif-example-balances"]
+
+[dependencies]
+pif-chain.workspace = true
+pif-example-balances = { workspace = true, optional = true }
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+pif-core.workspace = true
+pif-db.workspace = true
+
+subxt.workspace = true
+subxt-signer.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

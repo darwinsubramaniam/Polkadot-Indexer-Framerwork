@@ -1,0 +1,11 @@
+# Build artifacts
+/target/
+
+# Fetched by scripts/fetch-zombie-cli.sh — a 40MB prebuilt binary, not source.
+/bin/
+
+# Local environment overrides
+.env
+
+# macOS
+.DS_Store

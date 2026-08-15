@@ -1,0 +1,58 @@
+# Tier-1 development environment: one Postgres + one dev chain, always on.
+#
+# This is the fast inner loop. The realistic multi-node relay+parachain network used by
+# the e2e suite is spawned separately by zombie-cli (see crates/indexer-e2e).
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: indexer
+      POSTGRES_PASSWORD: indexer
+      POSTGRES_DB: substrate_indexer
+    ports:
+      # 5433 on the host: 5432 is commonly taken by an existing local Postgres or an
+      # SSH tunnel, and colliding with those is a confusing failure to debug.
+      - "5433:5432"
+    volumes:
+      # Postgres 18 changed the expected mount point: the volume goes at
+      # /var/lib/postgresql (not .../data), so the server can keep major-version
+      # subdirectories and support `pg_upgrade --link`. Mounting the old path makes
+      # the image refuse to start.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U indexer -d substrate_indexer"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  node:
+    image: parity/polkadot:stable2606
+    # parity publishes linux/amd64 only; on Apple Silicon this runs under Rosetta.
+    platform: linux/amd64
+    command:
+      - --dev
+      # --dev implies --tmp, which wipes chain state on every restart. An explicit
+      # --base-path overrides that, which is what makes the restart-resume behaviour
+      # of the indexer testable at all.
+      - --base-path=/data
+      - --rpc-external
+      - --rpc-cors=all
+      - --rpc-port=9944
+      - --rpc-methods=safe
+      - --no-telemetry
+      # An indexer backfills history, so it needs an ARCHIVE node. Substrate defaults to
+      # `--state-pruning 256`, which keeps state for only the last 256 blocks; once the
+      # chain passes that, indexing from genesis fails with
+      #   "State already discarded for 0x..." (RPC error 4003)
+      # because subxt cannot fetch the runtime version for a pruned block.
+      - --state-pruning=archive
+      - --blocks-pruning=archive
+    ports:
+      - "9944:9944"
+    volumes:
+      - nodedata:/data
+
+volumes:
+  pgdata:
+  nodedata:

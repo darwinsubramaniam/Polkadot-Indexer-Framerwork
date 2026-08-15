@@ -1,0 +1,26 @@
+# Multi-chain indexer configuration.
+#
+# This file is the whole story for "which chains do we index". Adding a chain means
+# adding a block here — no code change, no recompile. Everything else about a chain
+# (its name, SS58 prefix, token symbol/decimals, genesis hash) is discovered from the
+# node on first connect and recorded in the `chains` table.
+
+[[chains]]
+# Stable key. Becomes the primary key in every table, so don't rename it casually.
+id = "dev-local"
+ws_url = "ws://127.0.0.1:9944"
+# Block to start from when there is no stored cursor. 0 = genesis.
+start_block = 0
+# Typed-overlay handlers to run for this chain, by name. Empty = dynamic decoding only,
+# which is what makes the indexer work against an arbitrary Substrate chain.
+# A handler only activates if its compiled metadata matches this chain (see `supports()`).
+handlers = []
+
+# Example of a second chain indexed by the same process, with a typed projection enabled.
+# Requires building with `--features handler-balances`.
+#
+# [[chains]]
+# id = "para-1000"
+# ws_url = "ws://127.0.0.1:9988"
+# start_block = 0
+# handlers = ["balances-transfer"]

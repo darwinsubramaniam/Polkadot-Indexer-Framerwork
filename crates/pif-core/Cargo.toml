@@ -1,0 +1,27 @@
+[package]
+name = "polkadot-indexer-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Configuration, SCALE-to-JSON codec and SS58 encoding for the Polkadot Indexer Framework"
+repository = "https://github.com/darwinsubramaniam/polkadot-indexer-framework"
+homepage = "https://github.com/darwinsubramaniam/polkadot-indexer-framework"
+readme = "../../README.md"
+keywords = ["polkadot", "substrate", "indexer", "blockchain", "subxt"]
+categories = ["database", "command-line-utilities"]
+
+[lib]
+# Short import name: `use pif_core::…`. The published package name is longer for
+# discoverability on crates.io; Cargo allows the two to differ.
+name = "pif_core"
+
+[dependencies]
+scale-value.workspace = true
+bs58 = "0.5"
+blake2 = "0.10"
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+tracing.workspace = true

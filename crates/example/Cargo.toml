@@ -1,0 +1,20 @@
+[package]
+name = "pif-example-balances"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Not published: this is the template you copy to start a chain-specific indexer, not a
+# library to depend on.
+publish = false
+
+[dependencies]
+pif-core.workspace = true
+pif-db.workspace = true
+pif-chain.workspace = true
+
+sqlx.workspace = true
+bigdecimal.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+tracing.workspace = true
