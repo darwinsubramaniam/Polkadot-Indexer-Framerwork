@@ -10,7 +10,7 @@
 | **Affects** | `pif-core` (multi-endpoint config), `pif-chain` (pipeline split, endpoint pool), `pif-db` (batched writes, watermarks), `pif-cli` (new subcommands), `pif-api` (progress reports the digest watermark) |
 | **Supersedes** | The README's *"Not yet implemented: Parallel historical backfill (`ArchiveBackend`)"* |
 | **Load-bearing assumption** | Offline decode from archived bytes — **verified** against subxt 0.50.3, §9.1.1, and across a real runtime upgrade, §9.1.2 |
-| **Found on the way** | A live defect: the indexer halts on any runtime upgrade (§9.1.2). Fix ships independently — phase 0.5. |
+| **Found on the way** | A live defect: the indexer halted on any runtime upgrade (§9.1.2). **Fixed and shipped independently in `543a56f`** — phase 0.5, done. |
 
 ---
 
@@ -45,16 +45,17 @@ have.
 | I found a bug in `decode.rs`. | Same — re-fetch everything. | Same — re-digest locally. |
 | I have three RPC endpoints. Can I use them? | No. `ChainSource::Rpc { url: String }` holds exactly one. | Yes — a shared chunk queue, any healthy endpoint pulls from it. |
 | The chain is 28M blocks and my SSD is small. | Not a question the indexer answers. | Digested segments tier to a configured HDD path; replay reads them back. |
-| The chain performs a runtime upgrade. | **The indexer stops.** The upgrade block cannot be decoded with the metadata the node reports for it, so `decode_at` raises `ChainError::Decode` (§9.1.2). | Metadata resolves at the block's parent, and the archive records the runtime that *executed* each block. |
+| The chain performs a runtime upgrade. | ~~The indexer stops.~~ **Fixed in `543a56f`** — `decode_at` now resolves metadata at the block's parent (§9.1.2). Before that fix the upgrade block raised `ChainError::Decode` and the chain's indexer exited. | Unchanged by this proposal, which additionally records the executing runtime in the archive so a replay decodes the boundary too. |
 
 > [!NOTE]
 > Throughput is a *consequence* here, not the goal. The goal is that fetching and processing
 > stop being the same event, so that each can fail, retry, and be redone without the other.
 
-> [!WARNING]
-> The last row is not a limitation this proposal introduces or an improvement it offers — it
-> is a **defect present today**, found while verifying §9.1's assumptions and reproducible on
-> any chain that upgrades. Its fix is phase 0.5 and depends on nothing else here.
+> [!NOTE]
+> The last row was never a limitation this proposal introduced or an improvement it offered —
+> it was a **defect present in the indexer**, found while verifying §9.1's assumptions and
+> reproducible on any chain that upgrades. It is **fixed and merged** (`543a56f`), separately
+> from everything else here, which is why it reads as history rather than as a promise.
 
 ---
 
@@ -550,11 +551,16 @@ Stated so the next person does not over-read it:
 * **A dev chain, not an archive node.** Blocks were 2–3 extrinsics and ~30–320 bytes of events;
   nothing here says anything about throughput or segment sizing.
 
-#### 9.1.2 The upgrade block — a defect that already exists
+#### 9.1.2 The upgrade block — a defect that already existed *(fixed)*
 
-> [!WARNING]
-> **This is not a finding about the proposal. It is a bug in the indexer as it stands today,
-> and it will halt any chain the moment that chain upgrades its runtime.**
+> [!NOTE]
+> **This was never a finding about the proposal. It was a bug in the indexer, and it halted
+> any chain the moment that chain upgraded its runtime.**
+>
+> **Status: fixed in `543a56f`**, shipped on its own without any other part of this proposal.
+> The section is kept in full because the reasoning is what stops the same mistake being made
+> again — in the fetch stage, in the archive, or in the `runtime_upgrades` table (§9.4.6),
+> each of which has to make the identical parent-versus-block choice.
 
 Closing §9.1.1's "one runtime" gap meant performing a real forward runtime upgrade
 (westend `1022002 → 1024001`) and archiving blocks either side of it. The first attempt did
@@ -590,13 +596,33 @@ the one that cannot decode it.
 > and the block report the same version, so the rule changes nothing; at a boundary it is the
 > only correct answer. Genesis has no parent and executed nothing, so it stands for itself.
 
-**What this breaks today.** `decode_at` (`decode.rs:105`) reads `at.spec_version()` and decodes
-through the metadata subxt resolved for that same block. On any real runtime upgrade it
-therefore raises `ChainError::Decode`, `pipeline::run` propagates it, and
-`pif-cli/src/main.rs:126` logs `chain indexer stopped` and exits — the exact failure §2 opens
-with, arriving for a reason nobody has hit yet only because no test has ever upgraded a
-runtime under the indexer. **This wants fixing independently of IPD-002**, and the fix is a
-one-line change of which block the metadata is resolved at.
+**What this broke.** `decode_at` read `at.spec_version()` and decoded through the metadata
+subxt resolved for that same block. On any real runtime upgrade it raised
+`ChainError::Decode`, `pipeline::run` propagated it, and `pif-cli/src/main.rs:126` logged
+`chain indexer stopped` and exited — the exact failure §2 opens with, unhit for years only
+because no test had ever upgraded a runtime under the indexer.
+
+**What the fix does** (`543a56f`). `executing_runtime()` resolves the block's parent via
+`header.parent_hash`; genesis stands for itself. Then:
+
+* **Events** are taken as a raw blob from the block and decoded with the executing runtime.
+  `Events::bytes()` performs no decoding, so this works on every transport — and events are
+  the half that actually fails, since an upgrade reshapes the event enum far more often than
+  it renumbers calls.
+* **Extrinsics** keep the previous path whenever the block and its parent share a runtime, so
+  the common case costs nothing extra. Only at an upgrade block is the raw body fetched via
+  `chain_getBlock` and decoded with the parent's metadata. That asymmetry is forced: subxt
+  exposes no way to read the bytes back out of an `Extrinsics` without first decoding them,
+  which is precisely what cannot be done with the wrong metadata.
+* `NewBlock.spec_version` now records the **executing** runtime. Identical for every block but
+  an upgrade block, and those were never successfully indexed, so no existing row changes
+  meaning.
+* New `ChainError::UpgradeBlockBodyUnavailable`. `chain_getBlock` is a legacy RPC a light
+  client does not serve, so a light client meeting an upgrade block now gets a named
+  limitation instead of a silent mis-decode.
+
+It was not, in the end, the one-line change it looked like — the extrinsic path had no
+metadata-free way back to the bytes.
 
 **How deep it goes.** subxt's own transaction path has the same assumption:
 `wait_for_success()` on the `set_code` extrinsic fails with the identical error, because it
@@ -1270,7 +1296,7 @@ parses in tests and fails in the field.
 | `src/pipeline.rs:192` | Gap detection reads the **fetch** watermark. |
 | `src/pipeline.rs:296-300` | `persist` becomes `persist_batch` over K blocks, with the linkage assertion before the transaction opens. |
 | `src/cache.rs` *(new)* | `CachedStorage` — the `StorageAt` decorator of §6.1, over `pif_store::StorageCache`. Lives here, not in `pif-store`, for the reason in §11.1.1. |
-| `src/decode.rs:105` | **Bug fix, shippable on its own.** `decode_at` must resolve metadata at the block's **parent**, not at the block (§9.1.2). As written it fails on every runtime upgrade and halts the chain. This is not part of the pipeline split and should not wait for it. |
+| ~~`src/decode.rs:105`~~ | **Done — `543a56f`.** `decode_at` resolves metadata at the block's **parent** (§9.1.2). Shipped on its own, ahead of the pipeline split. |
 | `src/client.rs` | Metadata cache keyed by `spec_version`, and connections held open. §9.1 quantifies why: ~400 KB per fetch, and a per-block `OnlineClient` pays it per block. |
 | `src/decode.rs` | `decode_at`'s body extracts into a core generic over `C: OfflineClientAtBlockT<PolkadotConfig>`, taking already-materialised `Events`/`Extrinsics` plus the header and hash. `decode_at` (online, fetches them) and the new `decode_stored(raw: &RawBlock, metadata, chain)` (offline, `from_bytes`) become thin wrappers. Verified viable in §9.1.1. |
 | `src/decode.rs:21` | `pub type AtBlock` is online-specific and stays, but the decode core must not be written against it — that alias is what would silently force the online client back into the offline path. |
@@ -1318,7 +1344,7 @@ a coherent system.
 | Phase | Ships | Usable outcome |
 |---|---|---|
 | **0 — Spike** *(done)* | `tests/decode_stored_spike.rs`, `tests/upgrade_boundary.rs`, `tests/common/offline.rs`, `networks/upgrade-boundary.toml`, `scripts/fetch-westend-runtime.sh` | The offline-decode assumption is verified, not assumed (§9.1.1), and the upgrade boundary is verified too (§9.1.2). Both kept as permanent guards. |
-| **0.5 — Upgrade-block fix** *(do first, independently)* | `decode_at` resolves metadata at the block's parent | **Closes a live defect that halts any chain on runtime upgrade** (§9.1.2). Ships alone, needs none of the rest of this proposal, and `upgrade_boundary.rs` already tests it. |
+| **0.5 — Upgrade-block fix** *(done — `543a56f`)* | `decode_at` resolves metadata at the block's parent; `UpgradeBlockBodyUnavailable`; the regression test in `upgrade_boundary.rs` | **Closed a live defect that halted any chain on runtime upgrade** (§9.1.2). Shipped alone, needing none of the rest of this proposal. |
 | **1 — Hot store + split** | `pif-store` (segment + metadata), watermark tables, `fetch`/`digest` as two tasks, single endpoint, unbatched writes, the `decode_at` generic-core refactor (§11.3), connection reuse + metadata cache (§9.1) | Blocks are archived. `pif replay` works for the *dynamic core*. Handlers that read storage still hit the network. |
 | **2 — Storage read cache** | `CachedStorage`, the max-lag brake, `StorageNotArchived` | **Replay is fully offline, including `pif-identity`.** This is the phase that makes phase 1 mean what it claims. |
 | **3 — Multi-endpoint** | `EndpointPool`, limiter, chunk lease queue, per-endpoint genesis + capability probe, linkage verification | Backfill parallelises across endpoints and survives a 429 or a dead provider. |
@@ -1348,7 +1374,8 @@ a coherent system.
 | **Disk sizing surprises.** | §9.1 states the expected volumes. `pif store status` reports actual hot/cold bytes per chain. |
 | **A replay runs against another chain's segments**, and nothing notices. | Real: §9.1.1 found `OfflineClient` performs no genesis check, so `guard_chain_identity` does not apply offline. Mitigated by scoping every path by `chain_id` (§11.1 `layout.rs`) and by running linkage verification on the replay path, not just the live digest (§10.2). |
 | **A replay spans a runtime upgrade** and the wrong metadata decodes a block. | Was real, now closed. `RawBlock.spec_version` records the runtime that *executed* the block — its parent's — not the one the node reports for it (§9.1.2). Verified by `upgrade_boundary.rs` across a genuine `1022002 → 1024001` upgrade. |
-| **The indexer meets a runtime upgrade on a live chain today.** | **Unmitigated, and it will halt that chain.** `decode_at` resolves metadata at the block rather than its parent, so the upgrade block raises `ChainError::Decode` (§9.1.2). The fix is independent of this proposal and should ship before it. |
+| **The indexer meets a runtime upgrade on a live chain.** | **Closed — `543a56f`.** `decode_at` resolves metadata at the block's parent, and `upgrade_boundary.rs` drives it across a genuine `1022002 → 1024001` upgrade on every run (§9.1.2). |
+| **A light client meets an upgrade block.** | Its raw body comes from `chain_getBlock`, which smoldot does not serve, so the digest stops with `UpgradeBlockBodyUnavailable` naming the limitation. Index that range from an rpc source. Chosen over a silent mis-decode; §15 already scopes light clients to head-following. |
 | **The fetch stage re-downloads metadata per block**, and transfer dwarfs the archive. | Metadata cached by `spec_version`, connections held open (§9.1). Measured: the naive version moved ~32 MB to archive 40 small blocks. |
 | **The archive is pinned to V14 metadata** because `state_getMetadata` returns the oldest format, and the richer versions become unobtainable once the archive node is gone. | Archive the highest format the node offers, recording which (§9.4.3.1). Measured on one runtime: V14 437 KB, V15 473 KB, V16 482 KB — all available simultaneously. |
 | **A chain moves to a metadata format subxt cannot read.** | Distinguishable failure (`RuntimeMetadata version {n} cannot be decoded from`), surfaced as `ChainError::UnsupportedMetadataVersion` and alerted on, rather than flattened into a generic decode error (§9.4.4). |
@@ -1408,8 +1435,16 @@ and `reset` helpers:
   permanent guard on the subxt offline-decode API, since a subxt upgrade that removed
   `EventsClient::from_bytes` would invalidate the whole proposal silently.
 * `tests/upgrade_boundary.rs` — **already written and passing** (§9.1.2). Performs a real
-  forward runtime upgrade and archives across it. Run it with `just zn-upgrade-up` then
-  `just test-upgrade-boundary`.
+  forward runtime upgrade and then checks two things against it: that the *archive* decodes
+  the whole range through one offline client holding both metadata versions, and that the
+  indexer's own `decode_at` handles the boundary — recording the upgrade block under the
+  previous spec version and later blocks under the new one. The second is the regression test
+  for `543a56f`. Run it with `just zn-upgrade-up` then `just test-upgrade-boundary`.
+
+  It also asserts the *naive* per-block-metadata path still fails at the upgrade block. If
+  that assertion ever fires, subxt has begun resolving the executing runtime itself and the
+  parent-runtime rule can be revisited deliberately — rather than being quietly dropped while
+  it is still load-bearing.
 * `tests/pipeline_split.rs` — index 0..200 against the compose dev node through fetch+digest;
   assert the rows are **identical** to those the current single-stage pipeline produces. This
   is the regression test that matters most.
@@ -1429,11 +1464,16 @@ Three things about the upgrade-boundary network are load-bearing and easy to get
 
 > [!NOTE]
 > **A single-validator `westend-local` stalls a few blocks after the upgrade** — observed
-> stopping dead at block 20, roughly six blocks past a `set_code` at block 14. The test is
-> unaffected because it archives its range immediately, but the stall is worth knowing: a
-> later transaction against that chain fails as `Transaction is outdated`, which reads like a
-> nonce bug and is not one. Do not build a test that assumes the chain keeps producing after
-> the upgrade.
+> stopping dead at block 20 more than once. A later transaction against that chain then fails
+> as `Transaction is outdated`, which reads like a nonce bug and is not one.
+>
+> This is not a hypothetical caution: the first version of the test *was* written assuming the
+> chain keeps producing, and hung indefinitely waiting for a finality that was never coming.
+> The test now submits its post-upgrade traffic under a timeout and treats it as best-effort
+> — the boundary is already covered by the pre-upgrade transfer and by the `sudo` extrinsic
+> inside the upgrade block — takes its range from the **finalized** head rather than the best
+> block, and asserts outright if the chain stalled before finalizing past the boundary. Any
+> test built on this network needs the same three properties.
 >
 > Relatedly, the relay authors on a fixed 6 s BABE slot, so **submitting transactions does not
 > make blocks arrive faster**. Only the parachain collators in `three-chain.toml` use
