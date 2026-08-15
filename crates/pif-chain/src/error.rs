@@ -87,6 +87,23 @@ pub enum ChainError {
     )]
     PrunedState { chain: String, number: u64 },
 
+    /// The block carrying a runtime upgrade could not have its body read.
+    ///
+    /// This block is the one case where the raw extrinsic bytes are needed rather than
+    /// subxt's decoded view: it was executed by the *previous* runtime, so it must be decoded
+    /// with the previous runtime's metadata, and there is no way to recover the bytes from an
+    /// `Extrinsics` that failed to decode. The bytes come from `chain_getBlock`, which a
+    /// light client does not serve.
+    #[error(
+        "chain {chain}: cannot read the body of block {number}, which carries a runtime \
+         upgrade.\n\
+         This block was executed by the previous runtime and must be decoded with the \
+         previous runtime's metadata, which needs its raw extrinsic bytes.\n\
+         A light client cannot supply them. Index this chain from an rpc source to pass \
+         the upgrade, then switch back if you wish."
+    )]
+    UpgradeBlockBodyUnavailable { chain: String, number: u64 },
+
     /// A storage read at a block failed for a reason other than pruning.
     ///
     /// Named separately from [`ChainError::Decode`] because the pallet and entry are what

@@ -66,7 +66,7 @@ async fn follows_polkadot_through_a_light_client() -> Result<()> {
         .context("finalized block stream ended")??;
 
     let at = decode::at_streamed_block(&block).await?;
-    let data = decode::decode_at(&at, &chain.info).await?;
+    let data = decode::decode_at(&chain.client, &chain.rpc, &at, &chain.info).await?;
 
     println!(
         "block {} — {} extrinsics, {} events",

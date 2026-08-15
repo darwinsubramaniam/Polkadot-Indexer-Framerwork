@@ -279,7 +279,7 @@ async fn persist(
     at: &AtBlock,
 ) -> Result<()> {
     let number = at.block_number();
-    let mut data = decode::decode_at(at, &chain.info).await?;
+    let mut data = decode::decode_at(&chain.client, &chain.rpc, at, &chain.info).await?;
     data.spec_name = spec_name.to_owned();
 
     // State at this exact block, for handlers whose pallet reports *that* something changed

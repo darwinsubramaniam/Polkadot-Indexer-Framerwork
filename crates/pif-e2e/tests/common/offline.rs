@@ -157,9 +157,6 @@ pub struct Fetcher {
     legacy: LegacyRpcMethods<RpcConfigFor<PolkadotConfig>>,
     /// spec_version -> raw metadata. The whole point of the struct.
     metadata_by_spec: HashMap<u32, Vec<u8>>,
-    /// block number -> (spec_version, transaction_version), so resolving a block's parent
-    /// runtime does not re-ask for a block we already looked at.
-    runtime_at_block: HashMap<u64, (u32, u32)>,
 }
 
 impl Fetcher {
@@ -171,7 +168,6 @@ impl Fetcher {
             client,
             legacy,
             metadata_by_spec: HashMap::new(),
-            runtime_at_block: HashMap::new(),
         })
     }
 
@@ -187,36 +183,36 @@ impl Fetcher {
 
         // The runtime that executed this block is the one at its parent. Genesis has no
         // parent and executed nothing, so it stands for itself.
+        //
+        // Resolved every time rather than cached by block number. An earlier version also
+        // recorded each block's *own* spec version on the way past, to save a lookup when the
+        // next block asked for it as its parent — but that recorded a version whose metadata
+        // had never been fetched, so the cache could report a hit for a spec version missing
+        // from `metadata_by_spec`. Metadata is the thing worth caching (~400 KB); one
+        // `at_block` is not, since subxt caches the decoded metadata per spec version itself.
         let runtime_block = number.saturating_sub(1);
-        let (spec_version, transaction_version) =
-            match self.runtime_at_block.get(&runtime_block).copied() {
-                Some(known) => known,
-                None => {
-                    let runtime_at = self.client.at_block(runtime_block).await?;
-                    let pair = (runtime_at.spec_version(), runtime_at.transaction_version());
-                    self.runtime_at_block.insert(runtime_block, pair);
+        let runtime_at = self.client.at_block(runtime_block).await?;
+        let spec_version = runtime_at.spec_version();
+        let transaction_version = runtime_at.transaction_version();
 
-                    // Raw metadata must come off the wire: `subxt_metadata::Metadata` has no
-                    // `Encode` impl, so already-decoded metadata cannot be re-serialised for
-                    // the archive. Fetch once per spec version, never once per block.
-                    if let std::collections::hash_map::Entry::Vacant(slot) =
-                        self.metadata_by_spec.entry(pair.0)
-                    {
-                        let bytes = self
-                            .legacy
-                            .state_get_metadata(Some(runtime_at.block_hash()))
-                            .await?
-                            .into_raw();
-                        slot.insert(bytes);
-                    }
-                    pair
-                }
-            };
+        // Raw metadata must come off the wire: `subxt_metadata::Metadata` has no `Encode`
+        // impl, so already-decoded metadata cannot be re-serialised for the archive. Fetch
+        // once per spec version, never once per block.
+        if let std::collections::hash_map::Entry::Vacant(slot) =
+            self.metadata_by_spec.entry(spec_version)
+        {
+            let bytes = self
+                .legacy
+                .state_get_metadata(Some(runtime_at.block_hash()))
+                .await?
+                .into_raw();
+            slot.insert(bytes);
+        }
 
         let metadata = self
             .metadata_by_spec
             .get(&spec_version)
-            .expect("metadata cached alongside the runtime version above")
+            .expect("just inserted above if it was missing")
             .clone();
 
         // Bytes are safe to take from the block's own handle — only their *interpretation*
@@ -230,11 +226,6 @@ impl Fetcher {
         for extrinsic in extrinsics.iter() {
             extrinsic_bytes.push(extrinsic?.bytes().to_vec());
         }
-
-        // Also remember this block's own runtime, so it is free when the next block asks
-        // for it as its parent.
-        self.runtime_at_block
-            .insert(number, (at.spec_version(), at.transaction_version()));
 
         let raw = RawBlock {
             number,

@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use common::offline::{Fetcher, Projection, RawBlock, decode_stored, offline_client_for};
+use pif_core::ChainConfig;
 use subxt::{OnlineClient, PolkadotConfig, dynamic::Value, transactions::dynamic};
 use subxt_signer::sr25519::dev;
 
@@ -94,6 +95,14 @@ async fn current_spec_version(url: &str) -> anyhow::Result<u32> {
     Ok(api.at_current_block().await?.spec_version())
 }
 
+/// Highest *finalized* block. Distinct from the best block, which on a stalled chain sits
+/// ahead of finality and would have the test archive blocks that can still change.
+async fn finalized_number(url: &str) -> anyhow::Result<u64> {
+    let config = ChainConfig::rpc("upgrade-boundary", url);
+    let chain = pif_chain::ChainClient::connect(&config).await?;
+    Ok(chain.finalized_number().await?)
+}
+
 #[tokio::test]
 #[ignore = "requires the upgrade-boundary zombienet network; see module docs"]
 async fn a_range_spanning_a_runtime_upgrade_decodes_offline() -> anyhow::Result<()> {
@@ -149,17 +158,43 @@ async fn a_range_spanning_a_runtime_upgrade_decodes_offline() -> anyhow::Result<
     );
     println!("spec_version after upgrade: {spec_after}");
 
-    // Signed traffic on the NEW runtime too.
+    // Signed traffic on the NEW runtime too — but on a strict timeout, because a
+    // single-validator westend-local reliably STALLS a few blocks after a forward upgrade
+    // (observed stopping dead at block 20). Waiting for finality on a chain that has stopped
+    // authoring never returns, so this is best-effort: the boundary itself is already
+    // covered by the pre-upgrade transfer and by the `sudo` extrinsic in the upgrade block.
     let api = OnlineClient::<PolkadotConfig>::from_insecure_url(&url).await?;
-    let post_block = signed_traffic(&api, 2_222_222_222).await?;
-    println!("post-upgrade signed extrinsic in block {post_block}");
-    let head = api.at_current_block().await?.block_number();
+    let post_block = match tokio::time::timeout(
+        Duration::from_secs(45),
+        signed_traffic(&api, 2_222_222_222),
+    )
+    .await
+    {
+        Ok(Ok(number)) => {
+            println!("post-upgrade signed extrinsic in block {number}");
+            Some(number)
+        }
+        Ok(Err(error)) => {
+            println!("post-upgrade transfer rejected ({error}); continuing without it");
+            None
+        }
+        Err(_) => {
+            println!("post-upgrade transfer timed out — chain stopped authoring after the \
+                      upgrade; continuing without it");
+            None
+        }
+    };
+
+    // The *finalized* head, not the best block: everything archived below must be final, and
+    // on a stalled chain the best block can sit ahead of finality indefinitely.
+    let head = finalized_number(&url).await?;
+    println!("finalized head: {head}");
     drop(api);
 
     // ---- archive a range straddling the boundary --------------------------------------
     let mut numbers: Vec<u64> = Vec::new();
     numbers.extend((upgrade_block.saturating_sub(4))..=head.min(upgrade_block + 8));
-    for extra in [pre_block, post_block] {
+    for extra in [Some(pre_block), post_block].into_iter().flatten() {
         if !numbers.contains(&extra) {
             numbers.push(extra);
         }
@@ -167,6 +202,12 @@ async fn a_range_spanning_a_runtime_upgrade_decodes_offline() -> anyhow::Result<
     numbers.sort_unstable();
     numbers.dedup();
     numbers.retain(|n| *n >= 1 && *n <= head);
+
+    assert!(
+        numbers.iter().any(|n| *n > upgrade_block),
+        "no finalized block after the upgrade at {upgrade_block} (finalized head {head}) — \
+         the chain stalled before finalizing past the boundary, so there is nothing to compare"
+    );
 
     // Connected *after* the upgrade, so the client's metadata cache is built against the
     // post-upgrade chain and both spec versions are resolved on demand.
@@ -274,6 +315,64 @@ async fn a_range_spanning_a_runtime_upgrade_decodes_offline() -> anyhow::Result<
     println!(
         "OK: {} blocks across spec versions {specs:?} decoded offline from archived bytes",
         archived.len()
+    );
+
+    // ---- the indexer's own decoder, across the same boundary ---------------------------
+    //
+    // Everything above tests the archive. This tests `decode.rs` itself, which is where the
+    // defect lived: before the fix, `decode_at` resolved metadata at the block rather than at
+    // its parent and raised `ChainError::Decode` on the upgrade block, stopping the chain.
+    let chain = pif_chain::ChainClient::connect(&ChainConfig::rpc("upgrade-boundary", &url))
+        .await
+        .context("connect for the decode_at check")?;
+
+    let mut decoded_specs = Vec::new();
+    for number in &numbers {
+        let at = pif_chain::decode::at_block(&chain.client, &chain.info, *number)
+            .await
+            .with_context(|| format!("at_block({number})"))?;
+
+        let data = pif_chain::decode::decode_at(&chain.client, &chain.rpc, &at, &chain.info)
+            .await
+            .with_context(|| {
+                format!("decode_at({number}) — this is the regression the fix addresses")
+            })?;
+
+        decoded_specs.push((*number, data.block.spec_version));
+        println!(
+            "decode_at block {number}: spec {} recorded, {} events, {} extrinsics",
+            data.block.spec_version,
+            data.events.len(),
+            data.extrinsics.len(),
+        );
+    }
+
+    // The upgrade block must be recorded under the runtime that EXECUTED it — the old one.
+    // Recording the reported version here is the same mistake in the database instead of the
+    // decoder, and it would make the block undecodable on any later replay.
+    let upgrade_row = decoded_specs
+        .iter()
+        .find(|(n, _)| *n == upgrade_block)
+        .expect("the upgrade block is inside the archived range");
+    assert_eq!(
+        upgrade_row.1 as u32, spec_before,
+        "block {upgrade_block} carries set_code, so it was executed by spec {spec_before} \
+         and must be recorded as such — got {}",
+        upgrade_row.1
+    );
+
+    let after: Vec<_> = decoded_specs
+        .iter()
+        .filter(|(n, _)| *n > upgrade_block)
+        .collect();
+    assert!(
+        after.iter().all(|(_, s)| *s as u32 == spec_after),
+        "blocks after the upgrade must be recorded under the new runtime: {after:?}"
+    );
+
+    println!(
+        "OK: decode_at handled the boundary — block {upgrade_block} recorded under spec \
+         {spec_before}, later blocks under {spec_after}"
     );
     Ok(())
 }

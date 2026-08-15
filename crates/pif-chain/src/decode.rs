@@ -82,12 +82,61 @@ pub async fn at_current_block(
 /// Fetch and decode a single block.
 pub async fn decode_block(
     client: &OnlineClient<PolkadotConfig>,
+    rpc: &crate::client::Rpc,
     chain: &ChainInfo,
     number: u64,
 ) -> Result<(AtBlock, BlockData)> {
     let at = at_block(client, chain, number).await?;
-    let data = decode_at(&at, chain).await?;
+    let data = decode_at(client, rpc, &at, chain).await?;
     Ok((at, data))
+}
+
+/// The runtime that **executed** a block, which is the one at its *parent*.
+///
+/// Not a subtlety — the difference is load-bearing at exactly one block per runtime upgrade,
+/// and getting it wrong stops the indexer dead.
+///
+/// A block carrying `System::set_code` is executed by the *old* runtime: Substrate defers the
+/// swap so the new code takes effect from the next block. Its events and extrinsics are
+/// therefore encoded against the old metadata. But that block's post-state already holds the
+/// new `:code`, so the node answers `state_getRuntimeVersion(this block)` — and
+/// `state_getMetadata` — with the *new* runtime. Decoding it with the metadata the node
+/// reports for it fails with "Can't decode event topics: Not enough data to fill buffer".
+///
+/// Resolving at the parent is uniform: away from an upgrade the two are the same runtime, so
+/// this changes nothing; at an upgrade it is the only correct answer. Genesis has no parent
+/// and executed nothing, so it stands for itself.
+///
+/// Costs one extra runtime-version lookup per block. Subxt caches metadata per spec version
+/// on the client, so the expensive part is paid once per runtime rather than once per block.
+async fn executing_runtime(
+    client: &OnlineClient<PolkadotConfig>,
+    chain: &ChainInfo,
+    at: &AtBlock,
+    parent_hash: subxt::config::HashFor<PolkadotConfig>,
+) -> Result<AtBlock> {
+    if at.block_number() == 0 {
+        return Ok(at.clone());
+    }
+
+    client
+        .at_block(parent_hash)
+        .await
+        .map_err(|source| ChainError::BlockRead {
+            number: at.block_number().saturating_sub(1),
+            source: Box::new(source),
+        })
+        .map_err(|e| match e {
+            // A pruned parent means the runtime that executed this block is unknowable from
+            // this node. Say so precisely rather than as a generic read failure.
+            ChainError::BlockRead { number, source } if is_pruned_state(&*source) => {
+                ChainError::PrunedState {
+                    chain: chain.id.clone(),
+                    number,
+                }
+            }
+            other => other,
+        })
 }
 
 /// Recognise the node's "state has been pruned" response.
@@ -102,9 +151,16 @@ pub(crate) fn is_pruned_state(error: &dyn std::error::Error) -> bool {
 }
 
 /// Decode an already-resolved block.
-pub async fn decode_at(at: &AtBlock, chain: &ChainInfo) -> Result<BlockData> {
+///
+/// Takes the client as well as the block because the metadata that decodes a block is not
+/// always the metadata the node reports *for* that block — see [`executing_runtime`].
+pub async fn decode_at(
+    client: &OnlineClient<PolkadotConfig>,
+    rpc: &crate::client::Rpc,
+    at: &AtBlock,
+    chain: &ChainInfo,
+) -> Result<BlockData> {
     let number = at.block_number();
-    let spec_version = at.spec_version();
 
     let header = at
         .block_header()
@@ -114,23 +170,60 @@ pub async fn decode_at(at: &AtBlock, chain: &ChainInfo) -> Result<BlockData> {
             source: Box::new(source),
         })?;
 
-    let events = at
+    // Everything below decodes through `runtime`, never through `at`.
+    let runtime = executing_runtime(client, chain, at, header.parent_hash).await?;
+    let spec_version = runtime.spec_version();
+
+    // Events: take the raw blob from this block and decode it with the executing runtime.
+    // `Events::bytes()` does no decoding, so this is safe on every transport — and it is the
+    // half that actually breaks in practice, since the event enum layout is what an upgrade
+    // most often reshapes.
+    let event_bytes = at
         .events()
         .fetch()
         .await
         .map_err(|source| ChainError::Decode {
             number,
             source: Box::new(source),
-        })?;
+        })?
+        .bytes()
+        .to_vec();
 
-    let extrinsics = at
-        .extrinsics()
-        .fetch()
-        .await
-        .map_err(|source| ChainError::Decode {
-            number,
-            source: Box::new(source),
-        })?;
+    let events = runtime.events().from_bytes(event_bytes);
+
+    // Extrinsics: away from an upgrade the block and its parent share a runtime, so the
+    // ordinary path is unchanged and costs nothing extra. Only at an upgrade block do the two
+    // differ, and only there is the raw body needed — subxt exposes no way to read the bytes
+    // back out of an `Extrinsics` without first decoding them, which is precisely what cannot
+    // be done here with the wrong metadata.
+    let extrinsics = if runtime.spec_version() == at.spec_version() {
+        at.extrinsics()
+            .fetch()
+            .await
+            .map_err(|source| ChainError::Decode {
+                number,
+                source: Box::new(source),
+            })?
+    } else {
+        let body = rpc
+            .chain_get_block(Some(at.block_hash()))
+            .await
+            .map_err(|source| ChainError::BlockRead {
+                number,
+                source: Box::new(source),
+            })?
+            .ok_or(ChainError::UpgradeBlockBodyUnavailable {
+                chain: chain.id.clone(),
+                number,
+            })?
+            .block
+            .extrinsics
+            .into_iter()
+            .map(|bytes| bytes.0)
+            .collect();
+
+        runtime.extrinsics().from_bytes(body).await
+    };
 
     // Decode events first: they carry the per-extrinsic outcome and fee, which the
     // extrinsic rows need.
