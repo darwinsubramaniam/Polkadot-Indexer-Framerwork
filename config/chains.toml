@@ -81,6 +81,14 @@
 # # Omit to decide from the endpoint: an archive node gets no brake, anything else gets 256.
 # # Set it to bound how far the archive can grow ahead of Postgres regardless.
 # max_digest_lag = 100000
+# # Blocks per digest transaction. A block that decodes in microseconds otherwise costs a
+# # fixed handful of round-trips to Postgres, and that is what the digest spends its time on.
+# #
+# # It does not weaken atomicity: the cursor and the watermark still commit WITH the rows they
+# # describe, for a batch instead of a block, and a partial batch rolls back whole. What it
+# # widens is what a handler failure re-does -- so `1` is a legitimate setting for a handler
+# # that is expensive to redo, and restores the old one-transaction-per-block behaviour.
+# digest_batch = 32
 
 [[chains]]
 # Stable key. Becomes the primary key in every table, so don't rename it casually.

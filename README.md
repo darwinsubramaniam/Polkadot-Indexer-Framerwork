@@ -424,11 +424,20 @@ the blocks, already guarded by its own table.
 cannot be reverted, so there is no reorg-handling code and the stored chain can never contain
 an orphaned block. Anything that changes this to follow best-blocks must add rollback logic.
 
-**One Postgres transaction per block.** The block row, its extrinsics, events, typed-overlay
-rows, the resume cursor and the digest watermark all commit together. No watermark can
-therefore run ahead of the data it describes, which is what makes restart-resume correct
-rather than merely likely. Every insert is `ON CONFLICT DO NOTHING`, so replaying a block is
-a no-op.
+**One Postgres transaction per batch of blocks.** The block rows, their extrinsics, events,
+typed-overlay rows, the resume cursor and the digest watermark all commit together. No
+watermark can therefore run ahead of the data it describes, which is what makes restart-resume
+correct rather than merely likely. Every insert is `ON CONFLICT DO NOTHING`, so replaying a
+block is a no-op.
+
+`pipeline.digest_batch` (default 32) is how many blocks share that transaction, and each table
+takes one `UNNEST` insert for the whole batch rather than one round-trip per row — a block
+that decodes in microseconds is otherwise priced entirely by how chatty it is with Postgres.
+The atomicity above is unchanged; only its grain is. What batching does widen is the blast
+radius of a handler failure, since the whole batch rolls back and is re-digested, so
+`digest_batch = 1` remains a legitimate setting for a handler that is expensive to redo. A
+batch is never *waited* for: whatever the fetch stage has made ready is what commits, so the
+batch size cannot stall the two stages against each other.
 
 **`fetch_watermark` is the highest *contiguous* block, never the highest present.** Parallel
 fetch means chunk 12 can finish before chunk 8, so a digest that asked "does block N+1

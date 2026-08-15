@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Phases 0, 0.5, 1, 2 and 3 shipped; 4–5 proposed |
+| **Status** | Phases 0, 0.5, 1, 2, 3 and 4 shipped; 5 proposed |
 | **Author** | Darwin Subramaniam |
 | **Created** | 2026-08-15 |
 | **Target** | Every chain reached over RPC (`ChainSource::Rpc`) |
@@ -1368,7 +1368,7 @@ parses in tests and fails in the field.
 | `src/config.rs:36` | `ChainSource::Rpc` gains `endpoints: Vec<Endpoint>` alongside `url`. |
 | `src/config.rs:172-200` | `TryFrom<RawChainConfig>` resolves the source from *three* spellings instead of two: `ws_url`, `[chains.source]` with `url`, and `[chains.source]` with `endpoints`. The existing "set either, not both" error (`config.rs:177-183`) extends to the new pair. |
 | `src/config.rs:156` | `RawChainConfig` gains `pipeline: Option<PipelineConfig>`. |
-| `src/config.rs` | New `PipelineConfig` (`hot_path`, `cold_path`, `chunk_size`, `retention`, `on_digest`, `max_digest_lag`), optional per chain, with a global default on `IndexerConfig` — which has no `deny_unknown_fields`, so a new top-level table is backwards compatible. **Each phase ships only the fields it honours** — `hot_path` and `segment_size` in phase 1, `max_digest_lag` in phase 2 — rather than declaring the whole table up front: a knob that parses and does nothing is worse than an absent one, because it reads as configured behaviour. The rest arrive with the phases that act on them, and `IndexerConfig`'s missing `deny_unknown_fields` is exactly what makes adding them later a non-event. |
+| `src/config.rs` | New `PipelineConfig` (`hot_path`, `cold_path`, `chunk_size`, `retention`, `on_digest`, `max_digest_lag`), optional per chain, with a global default on `IndexerConfig` — which has no `deny_unknown_fields`, so a new top-level table is backwards compatible. **Each phase ships only the fields it honours** — `hot_path` and `segment_size` in phase 1, `max_digest_lag` in phase 2, `chunk_size` in phase 3, `digest_batch` in phase 4 — rather than declaring the whole table up front: a knob that parses and does nothing is worse than an absent one, because it reads as configured behaviour. The rest arrive with the phases that act on them, and `IndexerConfig`'s missing `deny_unknown_fields` is exactly what makes adding them later a non-event. |
 | `src/config.rs:226` | `resolve_paths` resolves `hot_path`/`cold_path` relative to the config file, as it already does for chain specs — but checks `is_dir()` and **must not require pre-existence**, since the store is created on first run. |
 | `src/config.rs:261` | `validate()` gains: reject an empty `endpoints` list; apply the existing `ws://`/`wss://` check (`config.rs:286-293`) to *every* endpoint; reject `cold_path == hot_path`; reject an explicit `max_digest_lag > 256` when no endpoint declares `archive`. |
 
@@ -1387,7 +1387,7 @@ parses in tests and fails in the field.
 | `src/scheduler.rs` *(new)* | Chunk lease queue: claim with `FOR UPDATE SKIP LOCKED`, reclaim expired leases, enforce the max-lag brake. |
 | `src/pipeline.rs:104-112` | The serial catch-up loop splits into `fetch::run` and `digest::run`, spawned as two tasks per chain. |
 | `src/pipeline.rs:192` | Gap detection reads the **fetch** watermark. |
-| `src/pipeline.rs:296-300` | `persist` becomes `persist_batch` over K blocks, with the linkage assertion before the transaction opens. |
+| `src/pipeline.rs:296-300` | **Done — phase 4**, in `digest.rs` rather than `pipeline.rs`: the digest's `one` became `commit(from..=to)`, with the decode *and* the linkage assertion before the transaction opens. `pipeline.rs`'s own `persist` stays per block — it is the light-client head-following path, which has one block in hand at a time and nothing to batch. |
 | `src/cache.rs` *(new)* | `CachedStorage` — the `StorageAt` decorator of §6.1, over `pif_store::StorageCache`. Lives here, not in `pif-store`, for the reason in §11.1.1. |
 | ~~`src/decode.rs:105`~~ | **Done — `543a56f`.** `decode_at` resolves metadata at the block's **parent** (§9.1.2). Shipped on its own, ahead of the pipeline split. |
 | `src/client.rs` | Metadata cache keyed by `spec_version`, and connections held open. §9.1 quantifies why: ~400 KB per fetch, and a per-block `OnlineClient` pays it per block. |
@@ -1401,8 +1401,8 @@ parses in tests and fails in the field.
 |---|---|
 | `migrations/0002_pipeline.sql` *(new)* | The three tables of §9.2, plus an `ALTER TABLE runtime_versions` adding the archive's metadata columns (§9.4.6) — **not** a second runtime table. |
 | `src/repo.rs:125` | `write_block_in_tx`'s `runtime_versions` upsert is unchanged and stays correct. The fetch stage fills the new columns separately, on first sight of a `spec_version`, since it is the half that holds the metadata bytes. |
-| `src/repo.rs:137-142` | `write_block_in_tx`'s per-row `for` loops become `UNNEST`-based multi-row inserts. **This is not optional** — a block with 200 events currently costs 200+ sequential round-trips inside the transaction, and parallel fetch buys nothing until it is fixed. |
-| `src/repo.rs` | New `write_blocks_in_tx(tx, &[BlockData])`, `load_watermarks`, `advance_fetch_watermark`, `advance_digest_watermark`, `advance_archive_watermark`, and the chunk-queue functions. |
+| `src/repo.rs:137-142` | **Done — phase 4.** `write_block_in_tx`'s per-row `for` loops became `UNNEST`-based multi-row inserts. **This was not optional** — a block with 200 events cost 200+ sequential round-trips inside the transaction, and parallel fetch buys nothing until it is fixed. `write_block_in_tx` survives as a one-element call into the batch version, so there is one implementation rather than two that must agree. |
+| `src/repo.rs` | New `write_blocks_in_tx(tx, &[BlockData])`, `load_watermarks`, `advance_fetch_watermark`, `advance_digest_watermark`, `advance_archive_watermark`, and the chunk-queue functions. Four statements per batch — blocks, runtimes, extrinsics, events, in that order because the child tables carry a foreign key to `blocks`. `runtime_versions` is deduplicated in Rust rather than left to `ON CONFLICT`, so `first_seen_block` still comes from the lowest block of the batch and batching stays invisible in the rows. |
 
 `ON CONFLICT DO NOTHING` is preserved everywhere, so replay stays idempotent. sqlx's runtime
 API is used throughout (`repo.rs:3-7` — no `query!` macros, deliberately), so there is no
@@ -1442,7 +1442,7 @@ a coherent system.
 | **1 — Hot store + split** *(done)* | `pif-store` (segment + metadata), watermark tables, `fetch`/`digest` as two tasks, single endpoint, unbatched writes, the `decode_at` generic-core refactor (§11.3), connection reuse + metadata cache (§9.1), `pif fetch`/`digest`/`replay`/`store status`, `tests/pipeline_split.rs` | Blocks are archived. `pif replay` works for the *dynamic core* — verified against a dead address. Handlers that read storage still hit the network, and say so by name (`StorageNotArchived`) rather than reaching for it silently. |
 | **2 — Storage read cache** *(done)* | `pif_store::StorageCache`, `pif_chain::CachedStorage`, the max-lag brake with an archive-capability probe, `StorageNotArchived`, `ChainNotIndexed` | **Replay is fully offline, handlers included** — `pif replay` no longer opens a connection at all, and a miss is a named error rather than a silent fetch. This is the phase that makes phase 1 mean what it claims. |
 | **3 — Multi-endpoint** *(done)* | `EndpointPool`, `limiter.rs` (token bucket + AIMD + breaker), the chunk lease queue on `fetch_chunks`, per-endpoint genesis + capability probe, `AllEndpointsDown` / `EndpointGenesisMismatch` / `ChunksFailed`. Linkage verification and the capability probe had already landed in phases 1 and 2. | Backfill parallelises across endpoints and survives a 429 or a dead provider. Verified: two endpoints interleave chunks and produce the same chain as one; a dead member is skipped; all of them dead is a named failure. |
-| **4 — Batched digest** | `UNNEST` inserts, K-blocks-per-transaction | The digest stops being the bottleneck phase 3 just created. |
+| **4 — Batched digest** *(done)* | `write_blocks_in_tx` with `UNNEST` inserts, `pipeline.digest_batch` blocks per transaction, the never-wait-to-fill rule | The digest stops being the bottleneck phase 3 just created. Measured on a local dev chain, 701 blocks replayed from the archive with no network in play: **2.0 s at `digest_batch = 1`, 0.42 s at 32** — 2.9 ms per block down to 0.6 ms. These are near-empty blocks, so almost all of that is the per-block transaction round-trips; the `UNNEST` half pays off in proportion to how many rows a block actually has. |
 | **5 — Cold tiering** | `cold.rs`, `segments.tier`, `archive_watermark`, retention policy | History moves SSD → HDD and remains replayable. |
 
 > [!NOTE]
@@ -1450,6 +1450,22 @@ a coherent system.
 > visibly the bottleneck. That is preferable to reordering, because phase 4's batching changes
 > the transaction granularity, and it is far easier to justify and test that change once there
 > is a measurable queue behind it.
+
+> [!WARNING]
+> **A batch must never be waited for.** Found while shipping phase 4, and it is the same
+> deadlock as §6.3 wearing the digest's clothes: a digest that held blocks back until it had
+> `digest_batch` of them would, with `max_digest_lag` below the batch size, wait for blocks
+> the brake has already stopped the fetcher from producing — while the fetcher waits for a
+> digest watermark that is now never going to move.
+>
+> The rule is therefore the mirror of the fetch stage's *publish before blocking*: **commit
+> what is ready**. The batch bound is `min(digest_batch, fetch_watermark)`, so a partial batch
+> commits the moment the digest catches up, and `digest_batch` becomes a pure throughput knob
+> that cannot change whether the pipeline makes progress.
+>
+> `a_tight_brake_does_not_deadlock_the_two_stages` now runs `digest_batch = 30` against
+> `max_digest_lag = 3`, and `a_batched_digest_writes_the_same_rows` runs a batch ten times
+> wider than the whole range. Both fail by timing out.
 
 ---
 
@@ -1462,7 +1478,7 @@ a coherent system.
 | **A crash mid-tiering loses a segment.** | Move is copy → fsync → verify checksum → delete, never delete-then-record. `segments.tier` flips only after the copy is verified; a crash leaves two copies, which is recoverable, rather than none. |
 | **An endpoint serves a different fork** (or a load balancer serves an inconsistent view). | Per-endpoint genesis check at connect, plus `parent_hash` linkage verification at digest. A break raises `ChainLinkageBroken` and halts that chain rather than storing a spliced history. |
 | **Segment corruption** — bad disk, truncated write. | CRC32 per segment, verified on read and before any tiering delete. A corrupt segment raises `SegmentCorrupt`; recovery is to re-fetch that chunk, which the chunk queue already knows how to express. |
-| **The batched transaction weakens the atomicity guarantee** the README calls load-bearing. | It does not: the cursor still commits *with* the data it describes (`repo.rs:147-152`), just for K blocks instead of one. A partial batch rolls back whole. K is configurable and may be 1. |
+| **The batched transaction weakens the atomicity guarantee** the README calls load-bearing. | It does not: the cursor still commits *with* the data it describes (`repo.rs:147-152`), just for K blocks instead of one. A partial batch rolls back whole. K is `pipeline.digest_batch`, and may be 1. What it genuinely does widen is what a handler failure re-does — the batch, not the block — which is why 1 stays supported and documented rather than merely permitted. |
 | **Two processes both run `pif fetch`.** | `FOR UPDATE SKIP LOCKED` on the chunk queue makes this safe by construction; it is the reason for the lease design rather than an assignment table. |
 | **The storage cache is stale** — a handler is changed to read a *different* key. | The cache is keyed by `(pallet, entry, keys)`, so a new key is simply a miss. Misses during a normal digest fall through to the network; misses during an explicit replay are a loud error. |
 | **Disk sizing surprises.** | §9.1 states the expected volumes. `pif store status` reports actual hot/cold bytes per chain. |
@@ -1519,6 +1535,9 @@ a coherent system.
   rejected. Assertions go through the existing `full(&err)` helper (`config.rs:336`), which
   walks the `source` chain — a `TryFrom<RawChainConfig>` rejection is invisible in the
   top-level `Display`.
+* config: `digest_batch = 0` is rejected naming the key — it is a digest that commits nothing
+  and presents as a hang — while `1` is accepted and documented as the unbatched setting, so
+  batching never takes away the per-block grain from a handler that is expensive to redo
 * `shipped_config_file_is_valid` (`config.rs:619`) still passes against the updated
   `config/chains.toml`
 
@@ -1591,6 +1610,17 @@ Three things about the upgrade-boundary network are load-bearing and easy to get
   Run with `just zn-up` then `just zn-replay-offline`. It wants a **fresh** network, like
   the upgrade-boundary test: it claims a username and has registrar #0 judge an identity,
   neither of which can happen twice on one chain.
+* `pipeline_split.rs::a_batched_digest_writes_the_same_rows` — **written and passing.** The
+  phase-4 regression test: the same range indexed twice, once at `digest_batch = 1` and once
+  at a batch ten times wider than the range, compared row for row. Batching is a throughput
+  change and must be invisible in the data, so a row-level diff is the only assertion worth
+  making. The oversized batch is deliberate — it is what proves the digest commits what is
+  *ready* rather than waiting to fill, and a digest that waited would hang rather than fail,
+  which is why the test also bounds itself with a timeout and asserts the completed range,
+  the cursor and the watermark. Signed extrinsics — the `signer` and `fee` columns, which are
+  the ones `UNNEST` passes as nullable arrays — are covered by `live_node.rs`'s
+  `typed_overlay_projects_a_real_transfer`, since blocks 0..20 of a fresh dev chain hold only
+  inherents (see the warning at the top of this section).
 * `crates/pif-e2e/tests/pipeline_split.rs` — the same claim against the plain compose node,
   with a purpose-built state-reading handler. Faster and needs no parachain, so it is the one
   that runs routinely; the identity test above is what proves it on the handler people

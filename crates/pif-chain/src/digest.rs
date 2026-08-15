@@ -9,6 +9,11 @@
 //! question would step straight over a hole and record a gap as success. It asks
 //! `n <= fetch_watermark` instead, and only completed, synced work advances that.
 //!
+//! Blocks are committed a batch at a time — `pipeline.digest_batch` of them share one
+//! transaction — because the cost of a block that decodes in microseconds is otherwise
+//! dominated by round-trips to Postgres. A batch is never *waited* for: whatever is ready is
+//! what commits, so the batch size can never hold the fetch stage against the brake.
+//!
 //! Handlers that read chain *state* are served from the archive too. A block archive is not
 //! a state archive — `pallet_identity` emits `IdentitySet { who }` with no display name — so
 //! those reads are archived separately, keyed by the block they were made at. On the first
@@ -18,7 +23,7 @@
 use std::time::Duration;
 
 use pif_core::ChainInfo;
-use pif_db::repo;
+use pif_db::{BlockData, repo};
 use pif_store::{HotStore, StorageCache};
 use sqlx::PgPool;
 
@@ -49,9 +54,19 @@ pub struct Digest<'a> {
     /// not, and says so by name rather than reaching for the network behind your back.
     pub live: Option<&'a ChainClient>,
     pub spec_name: &'a str,
+    /// Blocks per transaction. `1` commits each block on its own, as this stage used to.
+    pub batch: u64,
 }
 
 impl Digest<'_> {
+    /// Blocks per transaction, never zero.
+    ///
+    /// Config rejects `0`, but a `Digest` can also be built in code; `0` there would be a
+    /// loop that commits nothing and reads exactly like a hang.
+    fn batch_size(&self) -> u64 {
+        self.batch.max(1)
+    }
+
     /// Digest archived blocks from `start` until `stop_at`, or forever.
     pub async fn run(&self, start: u64, stop_at: Option<u64>) -> Result<()> {
         let mut archive = Archive::new(self.store, self.chain);
@@ -60,7 +75,7 @@ impl Digest<'_> {
         // compares consecutive blocks it actually saw rather than trusting a stored row.
         let mut previous_hash: Option<Vec<u8>> = None;
 
-        tracing::info!(chain = %self.chain.id, start, "digest: starting");
+        tracing::info!(chain = %self.chain.id, start, batch = self.batch_size(), "digest: starting");
 
         loop {
             if stop_at.is_some_and(|stop| next > stop) {
@@ -72,31 +87,32 @@ impl Digest<'_> {
                 Some(marks) => marks.fetch,
                 None => -1,
             };
+            let last = match stop_at {
+                Some(stop) => ready.min(stop as i64),
+                None => ready,
+            };
 
-            while (next as i64) <= ready {
-                if stop_at.is_some_and(|stop| next > stop) {
-                    return Ok(());
-                }
+            while (next as i64) <= last {
+                // Bounded by what is *ready*, never by what would fill a batch. A digest
+                // that held blocks back until it had `batch` of them would bring back §6.3's
+                // deadlock in a new costume: with `max_digest_lag` below the batch size the
+                // fetcher stops at the brake, waiting for a digest that is itself waiting
+                // for blocks the fetcher has just stopped producing.
+                let end = (next + self.batch_size() - 1).min(last as u64);
 
-                let hash = self
-                    .one(&mut archive, next, previous_hash.as_deref())
-                    .await?;
-                previous_hash = Some(hash);
+                previous_hash = Some(
+                    self.commit(&mut archive, next, end, previous_hash.as_deref())
+                        .await?,
+                );
+                self.log_batch(next, end, "digested");
+                next = end + 1;
 
-                if next.is_multiple_of(100) {
-                    tracing::info!(chain = %self.chain.id, block = next, "digested");
-                } else {
-                    tracing::debug!(chain = %self.chain.id, block = next, "digested");
-                }
-
-                if stop_at.is_some_and(|stop| next >= stop) {
+                if stop_at.is_some_and(|stop| end >= stop) {
                     tracing::info!(
-                        chain = %self.chain.id, stop = next, "digest: reached stop_at, finishing"
+                        chain = %self.chain.id, stop = end, "digest: reached stop_at, finishing"
                     );
                     return Ok(());
                 }
-
-                next += 1;
             }
 
             // Caught up. Flushing here rather than per block because a lost cache entry
@@ -115,97 +131,139 @@ impl Digest<'_> {
     pub async fn replay_range(&self, from: u64, to: u64) -> Result<()> {
         let mut archive = Archive::new(self.store, self.chain);
         let mut previous_hash: Option<Vec<u8>> = None;
+        let mut next = from;
 
-        for number in from..=to {
-            let hash = self
-                .one(&mut archive, number, previous_hash.as_deref())
-                .await?;
-            previous_hash = Some(hash);
-
-            if number.is_multiple_of(100) || number == to {
-                tracing::info!(chain = %self.chain.id, block = number, "replayed");
-            }
+        while next <= to {
+            let end = (next + self.batch_size() - 1).min(to);
+            previous_hash = Some(
+                self.commit(&mut archive, next, end, previous_hash.as_deref())
+                    .await?,
+            );
+            self.log_batch(next, end, "replayed");
+            next = end + 1;
         }
 
         self.reads.sync()?;
+        tracing::info!(chain = %self.chain.id, from, to, "replay complete");
         Ok(())
     }
 
-    /// Decode one archived block and commit it, together with whatever its handlers derive.
+    /// Report a committed batch.
     ///
-    /// Returns the block's hash, so the caller can check the next block links to it.
+    /// One line per batch would be noise on a long run, so info is kept to batches spanning a
+    /// hundred-block boundary — the cadence the per-block digest logged at, independent of
+    /// how the blocks happen to be grouped.
+    fn log_batch(&self, from: u64, to: u64, what: &str) {
+        if (from..=to).any(|n| n.is_multiple_of(100)) {
+            tracing::info!(chain = %self.chain.id, from, to, "{what}");
+        } else {
+            tracing::debug!(chain = %self.chain.id, from, to, "{what}");
+        }
+    }
+
+    /// Decode `from..=to` out of the archive and commit them as one transaction, together
+    /// with whatever their handlers derive.
     ///
-    /// The core rows, every handler's rows, the cursor and the digest watermark share a
-    /// single transaction. A handler failure therefore rolls the entire block back, and no
-    /// watermark can ever be ahead of the data it claims to describe.
-    async fn one(
+    /// Returns the last block's hash, so the caller can check the next batch links to it.
+    ///
+    /// Every block's core rows, every handler's rows, the cursor and the digest watermark
+    /// share a single transaction. A handler failure therefore rolls the whole batch back —
+    /// not merely its own block — and the watermark still cannot be ahead of the data it
+    /// claims to describe. The atomicity the resume cursor rests on is unchanged; only its
+    /// grain is, and `digest_batch = 1` restores the old grain exactly.
+    async fn commit(
         &self,
         archive: &mut Archive<'_>,
-        number: u64,
+        from: u64,
+        to: u64,
         previous_hash: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
-        let (pool, chain, handlers, live, spec_name) = (
-            self.pool,
-            self.chain,
-            self.handlers,
-            self.live,
-            self.spec_name,
-        );
+        let chain = self.chain;
 
-        let raw = archive.get(number)?;
-        let mut data = archive.decode(&raw).await?;
-        data.spec_name = spec_name.to_owned();
+        // Decoded before the transaction opens, for two reasons. Decoding needs no database
+        // at all, so doing it inside would hold locks across pure CPU work; and the linkage
+        // check has to be settled before anything is written, so a spliced batch never
+        // becomes rows to be rolled back.
+        let mut blocks: Vec<BlockData> = Vec::with_capacity((to - from + 1) as usize);
+        let mut spec_versions: Vec<u32> = Vec::with_capacity(blocks.capacity());
+        let mut link: Option<Vec<u8>> = previous_hash.map(<[u8]>::to_vec);
 
-        // Nothing verified this before the split, because one endpoint fetched every block
-        // in order and there was nothing to disagree with. It matters most on the replay
-        // path: `OfflineClient` performs no genesis check — it stores the genesis hash
-        // unchecked, and a replay leaves it unset — so this is the only thing standing
-        // between a replay and another chain's segments.
-        if let Some(expected) = previous_hash
-            && expected != data.block.parent_hash.as_slice()
-        {
-            return Err(ChainError::ChainLinkageBroken {
-                chain: chain.id.clone(),
-                number,
-                expected: hex::encode(expected),
-                found: hex::encode(&data.block.parent_hash),
-            });
+        for number in from..=to {
+            let raw = archive.get(number)?;
+            let mut data = archive.decode(&raw).await?;
+            data.spec_name = self.spec_name.to_owned();
+
+            // Nothing verified this before the split, because one endpoint fetched every
+            // block in order and there was nothing to disagree with. It matters most on the
+            // replay path: `OfflineClient` performs no genesis check — it stores the genesis
+            // hash unchecked, and a replay leaves it unset — so this is the only thing
+            // standing between a replay and another chain's segments.
+            if let Some(expected) = &link
+                && expected.as_slice() != data.block.parent_hash.as_slice()
+            {
+                return Err(ChainError::ChainLinkageBroken {
+                    chain: chain.id.clone(),
+                    number,
+                    expected: hex::encode(expected),
+                    found: hex::encode(&data.block.parent_hash),
+                });
+            }
+
+            link = Some(data.block.hash.clone());
+            spec_versions.push(raw.spec_version);
+            blocks.push(data);
         }
 
-        // State at this exact block, for handlers whose pallet reports *that* something
-        // changed without reporting *what* it changed to. Answered from the archive when it
-        // has been read here before; only a genuine miss touches the network, and only if
-        // there is a node to touch.
-        let storage = CachedStorage::new(
-            self.reads,
-            chain,
-            number,
-            live.map(|client| &client.client),
-            archive.metadata_for(raw.spec_version),
-        );
+        // State at each block, for handlers whose pallet reports *that* something changed
+        // without reporting *what* it changed to. Answered from the archive when it has been
+        // read there before; only a genuine miss touches the network, and only if there is a
+        // node to touch.
+        //
+        // Built after the decode loop rather than inside it because the archive is borrowed
+        // mutably there, and each view needs the metadata that decoded its block.
+        let storages: Vec<CachedStorage<'_>> = (from..=to)
+            .zip(&spec_versions)
+            .map(|(number, spec_version)| {
+                CachedStorage::new(
+                    self.reads,
+                    chain,
+                    number,
+                    self.live.map(|client| &client.client),
+                    archive.metadata_for(*spec_version),
+                )
+            })
+            .collect();
 
-        let ctx = BlockContext {
-            chain,
-            block_number: number,
-            block_hash: &data.block.hash,
-            storage: &storage,
-        };
+        let mut tx = self.pool.begin().await?;
+        repo::write_blocks_in_tx(&mut tx, &blocks).await?;
 
-        let mut tx = pool.begin().await?;
-        repo::write_block_in_tx(&mut tx, &data).await?;
-        handlers.run(&ctx, &data, &mut tx).await?;
+        for ((number, data), storage) in (from..=to).zip(&blocks).zip(&storages) {
+            let ctx = BlockContext {
+                chain,
+                block_number: number,
+                block_hash: &data.block.hash,
+                storage,
+            };
+            self.handlers.run(&ctx, data, &mut tx).await?;
+        }
+
+        let last = blocks
+            .last()
+            .expect("from <= to, so a batch is never empty");
         // Kept in step with `digest_watermark` so pif-api's progress query and any external
         // consumer keep working through the transition. `pipeline_watermarks` is the
         // authority.
-        repo::update_cursor(&mut tx, &chain.id, data.block.number, &data.block.hash).await?;
-        repo::advance_digest_watermark(&mut tx, &chain.id, data.block.number).await?;
+        repo::update_cursor(&mut tx, &chain.id, last.block.number, &last.block.hash).await?;
+        repo::advance_digest_watermark(&mut tx, &chain.id, last.block.number).await?;
         tx.commit().await?;
 
-        // After the commit, not before: the archive should record reads belonging to a block
+        // After the commit, not before: the archive should record reads belonging to blocks
         // that actually landed. A block whose reads all hit writes nothing at all, so a warm
         // re-digest does not churn the cache.
-        storage.persist()?;
+        for storage in &storages {
+            storage.persist()?;
+        }
 
-        Ok(data.block.hash)
+        Ok(last.block.hash.clone())
     }
 }

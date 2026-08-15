@@ -118,6 +118,7 @@ pub async fn run(
         // has one: a pruned node answers for blocks perfectly well but not for their state.
         live: Some(&chain.client),
         spec_name: &spec_name,
+        batch: config.pipeline().digest_batch,
     };
 
     let fetch = fetch::Fetch {
@@ -202,6 +203,7 @@ pub async fn digest_only(
         handlers,
         live: resolved.client.as_ref(),
         spec_name: &resolved.spec_name,
+        batch: config.pipeline().digest_batch,
     }
     .run(start, options.stop_at)
     .await
@@ -242,6 +244,7 @@ pub async fn replay(
         handlers,
         live: None,
         spec_name: &resolved.spec_name,
+        batch: config.pipeline().digest_batch,
     }
     .replay_range(from, to)
     .await

@@ -162,6 +162,9 @@ async fn the_identity_handler_replays_with_no_network() -> Result<()> {
         segment_size: 64,
         chunk_size: 16,
         max_digest_lag: None,
+        // Several blocks per transaction, so the identity projection this test compares is
+        // built by the batched digest rather than by a path only this test would take.
+        digest_batch: 8,
     };
 
     // ---- traffic: every storage read the handler makes, exercised -----------------------

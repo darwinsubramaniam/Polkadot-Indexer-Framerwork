@@ -43,6 +43,10 @@ fn chain_config(id: &str, dir: &std::path::Path, handlers: Vec<String>) -> Chain
             // above the range below, so the brake never engages here. It is exercised
             // deliberately in `the_fetch_stage_will_not_outrun_the_digest`.
             max_digest_lag: None,
+            // Deliberately not a divisor of the 21-block range, so every test in this file
+            // runs the batched digest *and* its ragged final batch rather than a run that
+            // happens to come out even.
+            digest_batch: 7,
         })
 }
 
@@ -176,6 +180,88 @@ async fn the_split_pipeline_writes_the_same_rows() -> Result<()> {
     Ok(())
 }
 
+/// Batching the digest must not change a single row it writes.
+///
+/// The `UNNEST` inserts and the K-blocks-per-transaction commit are a throughput change and
+/// nothing else, so the falsifiable form is a row-for-row comparison against the unbatched
+/// path: same range, one chain committing a block at a time, the other committing the lot in
+/// batches larger than the range itself.
+///
+/// A batch wider than the range is the deliberate case. It is what proves the digest commits
+/// what is *ready* rather than waiting to fill a batch — a digest that waited would hang here
+/// rather than fail, which is why the assertion is a completed range and not just equal rows.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn a_batched_digest_writes_the_same_rows() -> Result<()> {
+    let pool = pool().await?;
+
+    let unbatched_id = "e2e-digest-unbatched";
+    let unbatched_dir = tempfile::tempdir()?;
+    reset(&pool, unbatched_id).await?;
+    let mut config = chain_config(unbatched_id, unbatched_dir.path(), vec![]);
+    config.pipeline.as_mut().expect("pipeline").digest_batch = 1;
+    pipeline::run(
+        &pool,
+        &config,
+        &pif_e2e::registry(),
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+
+    let batched_id = "e2e-digest-batched";
+    let batched_dir = tempfile::tempdir()?;
+    reset(&pool, batched_id).await?;
+    let mut config = chain_config(batched_id, batched_dir.path(), vec![]);
+    // Wider than the whole range, so the only way this finishes is by committing a partial
+    // batch the moment the fetch stage stops feeding it.
+    config.pipeline.as_mut().expect("pipeline").digest_batch = LAST_BLOCK * 10;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        pipeline::run(
+            &pool,
+            &config,
+            &pif_e2e::registry(),
+            IndexOptions {
+                from: Some(0),
+                stop_at: Some(LAST_BLOCK),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the digest waited to fill a batch that never filled"))??;
+
+    let unbatched = snapshot(&pool, unbatched_id).await?;
+    let batched = snapshot(&pool, batched_id).await?;
+
+    assert_eq!(
+        batched.blocks.len() as u64,
+        LAST_BLOCK + 1,
+        "expected every block in 0..={LAST_BLOCK}"
+    );
+    assert_eq!(
+        unbatched, batched,
+        "batching the digest changed the rows it writes"
+    );
+    assert_eq!(pif_db::repo::count_gaps(&pool, batched_id).await?, 0);
+
+    // The cursor and the watermark commit *with* the batch, so both must name its last
+    // block. A batched commit that advanced either one separately would be the way this
+    // change could quietly break restart-resume.
+    let marks = pif_db::repo::load_watermarks(&pool, batched_id)
+        .await?
+        .expect("watermarks");
+    assert_eq!(marks.digest, LAST_BLOCK as i64);
+    let cursor = pif_db::repo::load_cursor(&pool, batched_id)
+        .await?
+        .expect("cursor");
+    assert_eq!(cursor.last_indexed_block, LAST_BLOCK as i64);
+
+    Ok(())
+}
+
 /// The headline claim: replay reads the archive and touches no network.
 ///
 /// Proved by pointing the chain at a **dead address** before replaying. If any part of the
@@ -218,6 +304,7 @@ async fn a_replay_needs_no_network_at_all() -> Result<()> {
         // rather than one worker taking the lot.
         chunk_size: 4,
         max_digest_lag: None,
+        digest_batch: 7,
     });
 
     pipeline::replay(&pool, &unreachable, &pif_e2e::registry(), 0, LAST_BLOCK).await?;
@@ -252,6 +339,7 @@ async fn the_fetch_stage_will_not_outrun_the_digest() -> Result<()> {
         segment_size: 8,
         chunk_size: 4,
         max_digest_lag: Some(LAG),
+        digest_batch: 7,
     });
 
     // Fetch alone, with nothing digesting. It must archive up to the ceiling and then hold,
@@ -315,6 +403,10 @@ async fn a_tight_brake_does_not_deadlock_the_two_stages() -> Result<()> {
         segment_size: 8,
         chunk_size: 4,
         max_digest_lag: Some(3),
+        // Ten times the brake, which is the same deadlock in the digest's costume: a digest
+        // that waited to fill a batch would wait for blocks the brake has already stopped the
+        // fetcher from producing. It commits what is ready instead, so this must still finish.
+        digest_batch: 30,
     });
 
     tokio::time::timeout(
@@ -468,6 +560,7 @@ async fn a_state_reading_handler_replays_with_no_network() -> Result<()> {
             // rather than one worker taking the lot.
             chunk_size: 4,
             max_digest_lag: None,
+            digest_batch: 7,
         });
 
     pipeline::replay(&pool, &unreachable, &registry, 0, LAST_BLOCK).await?;
@@ -521,6 +614,7 @@ async fn an_unarchived_storage_read_stops_a_replay_by_name() -> Result<()> {
             // rather than one worker taking the lot.
             chunk_size: 4,
             max_digest_lag: None,
+            digest_batch: 7,
         });
 
     let error = pipeline::replay(&pool, &config, &registry, 0, LAST_BLOCK)
@@ -559,6 +653,7 @@ fn multi_endpoint_config(id: &str, dir: &std::path::Path, urls: &[&str]) -> Chai
             segment_size: 8,
             chunk_size: 4,
             max_digest_lag: None,
+            digest_batch: 7,
         }),
     }
 }

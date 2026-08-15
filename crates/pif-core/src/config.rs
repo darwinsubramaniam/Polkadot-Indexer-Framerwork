@@ -71,6 +71,25 @@ pub struct PipelineConfig {
     /// 256. Set it to bound how far the archive can grow ahead of Postgres regardless.
     #[serde(default)]
     pub max_digest_lag: Option<u64>,
+
+    /// Blocks per digest transaction.
+    ///
+    /// The digest commits its core rows, its handlers' rows, the cursor and the watermark in
+    /// one transaction. Doing that per block makes the cost per block a fixed number of
+    /// round-trips regardless of how little the block contained; sharing a transaction across
+    /// a run of blocks amortises it.
+    ///
+    /// It does **not** weaken the atomicity the resume cursor depends on: the cursor still
+    /// commits with the data it describes, for a batch instead of a block, and a partial
+    /// batch rolls back whole. What it does widen is the blast radius of a handler failure —
+    /// the whole batch is rolled back and re-digested — so `1` remains a legitimate setting
+    /// for a handler that is expensive to redo.
+    ///
+    /// A batch is never *waited* for: the digest commits what is ready rather than holding
+    /// blocks back until it has this many, so a value above `max_digest_lag` cannot stall the
+    /// two stages against each other.
+    #[serde(default = "default_digest_batch")]
+    pub digest_batch: u64,
 }
 
 fn default_hot_path() -> PathBuf {
@@ -85,6 +104,12 @@ fn default_chunk_size() -> u64 {
     128
 }
 
+/// Enough to amortise the per-transaction round-trips over a run of blocks, and small enough
+/// that a handler failure costs a re-digest of seconds rather than minutes.
+fn default_digest_batch() -> u64 {
+    32
+}
+
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
@@ -92,6 +117,7 @@ impl Default for PipelineConfig {
             segment_size: default_segment_size(),
             chunk_size: default_chunk_size(),
             max_digest_lag: None,
+            digest_batch: default_digest_batch(),
         }
     }
 }
@@ -614,12 +640,27 @@ impl IndexerConfig {
                         chain.id
                     )));
                 }
+                // Zero blocks per transaction is a digest that commits nothing, which reads
+                // as a hang rather than as a misconfiguration. `1` is the unbatched setting.
+                if pipeline.digest_batch == 0 {
+                    return Err(Error::ConfigInvalid(format!(
+                        "chain {:?}: pipeline.digest_batch must be at least 1; 1 means one \
+                         transaction per block",
+                        chain.id
+                    )));
+                }
             }
         }
 
         if self.pipeline.segment_size == 0 {
             return Err(Error::ConfigInvalid(
                 "pipeline.segment_size must be greater than zero".into(),
+            ));
+        }
+        if self.pipeline.digest_batch == 0 {
+            return Err(Error::ConfigInvalid(
+                "pipeline.digest_batch must be at least 1; 1 means one transaction per block"
+                    .into(),
             ));
         }
 
@@ -1101,6 +1142,45 @@ mod tests {
         let pipeline = config.chains[0].pipeline();
         assert_eq!(pipeline.hot_path, PathBuf::from(".pif-store"));
         assert_eq!(pipeline.segment_size, 1000);
+        assert_eq!(pipeline.digest_batch, 32);
+    }
+
+    #[test]
+    fn rejects_a_digest_batch_of_zero() {
+        // Zero blocks per transaction is a digest that commits nothing and never advances
+        // its watermark, which presents as a hang rather than as a bad setting.
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+            ws_url = "ws://127.0.0.1:9944"
+
+            [chains.pipeline]
+            digest_batch = 0
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("digest_batch"), "got: {err}");
+    }
+
+    #[test]
+    fn a_digest_batch_of_one_is_the_unbatched_setting() {
+        // Explicitly allowed: a handler that is expensive to redo is worth committing per
+        // block, and the phase-4 batching must not take that away.
+        let config = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+            ws_url = "ws://127.0.0.1:9944"
+
+            [chains.pipeline]
+            digest_batch = 1
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.chains[0].pipeline().digest_batch, 1);
     }
 
     #[test]

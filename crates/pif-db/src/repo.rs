@@ -9,7 +9,7 @@
 use pif_core::ChainInfo;
 use sqlx::{PgConnection, PgPool};
 
-use crate::models::{ArchivedRuntime, BlockData, Cursor, NewEvent, NewExtrinsic, Watermarks};
+use crate::models::{ArchivedRuntime, BlockData, Cursor, Watermarks};
 
 pub type DbResult<T> = Result<T, sqlx::Error>;
 
@@ -94,52 +94,129 @@ pub async fn write_block(pool: &PgPool, data: &BlockData) -> DbResult<()> {
 /// inside the *same* transaction, between these rows and the cursor update. Handlers own
 /// their tables, so the framework never needs to know what they write.
 pub async fn write_block_in_tx(tx: &mut PgConnection, data: &BlockData) -> DbResult<()> {
-    let block = &data.block;
+    write_blocks_in_tx(tx, std::slice::from_ref(data)).await
+}
+
+/// Write a run of blocks' core rows into an existing transaction, without committing.
+///
+/// Four statements for the whole batch — one per table — rather than one per row. Written a
+/// row at a time, a block with 200 events costs 200 sequential round-trips *inside* the
+/// transaction, and every one of them is a full network wait during which the transaction
+/// holds its locks and nothing else in the batch progresses. `UNNEST` collapses that to one
+/// round-trip per table per batch, which is what stops the digest being the pipeline's
+/// bottleneck now that fetching runs in parallel.
+///
+/// The order is load-bearing: `extrinsics` and `events` carry a foreign key to `blocks`, so
+/// the blocks go in first. Every insert stays `ON CONFLICT DO NOTHING`, so replaying a range
+/// already indexed remains a no-op rather than an error.
+pub async fn write_blocks_in_tx(tx: &mut PgConnection, batch: &[BlockData]) -> DbResult<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    insert_blocks(&mut *tx, batch).await?;
+    insert_runtime_versions(&mut *tx, batch).await?;
+    insert_extrinsics(&mut *tx, batch).await?;
+    insert_events(&mut *tx, batch).await?;
+
+    Ok(())
+}
+
+async fn insert_blocks(tx: &mut PgConnection, batch: &[BlockData]) -> DbResult<()> {
+    let n = batch.len();
+    let mut chain_id = Vec::with_capacity(n);
+    let mut number = Vec::with_capacity(n);
+    let mut hash = Vec::with_capacity(n);
+    let mut parent_hash = Vec::with_capacity(n);
+    let mut state_root = Vec::with_capacity(n);
+    let mut extrinsics_root = Vec::with_capacity(n);
+    let mut spec_version = Vec::with_capacity(n);
+    let mut timestamp = Vec::with_capacity(n);
+    let mut extrinsic_count = Vec::with_capacity(n);
+    let mut event_count = Vec::with_capacity(n);
+
+    for data in batch {
+        let block = &data.block;
+        chain_id.push(block.chain_id.as_str());
+        number.push(block.number);
+        hash.push(block.hash.as_slice());
+        parent_hash.push(block.parent_hash.as_slice());
+        state_root.push(block.state_root.as_slice());
+        extrinsics_root.push(block.extrinsics_root.as_slice());
+        spec_version.push(block.spec_version);
+        timestamp.push(block.timestamp);
+        extrinsic_count.push(block.extrinsic_count);
+        event_count.push(block.event_count);
+    }
+
     sqlx::query(
         r#"
         INSERT INTO blocks (
             chain_id, number, hash, parent_hash, state_root, extrinsics_root,
             spec_version, timestamp, extrinsic_count, event_count
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        SELECT * FROM UNNEST(
+            $1::text[], $2::bigint[], $3::bytea[], $4::bytea[], $5::bytea[], $6::bytea[],
+            $7::int[], $8::timestamptz[], $9::int[], $10::int[]
+        )
         ON CONFLICT (chain_id, number) DO NOTHING
         "#,
     )
-    .bind(&block.chain_id)
-    .bind(block.number)
-    .bind(&block.hash)
-    .bind(&block.parent_hash)
-    .bind(&block.state_root)
-    .bind(&block.extrinsics_root)
-    .bind(block.spec_version)
-    .bind(block.timestamp)
-    .bind(block.extrinsic_count)
-    .bind(block.event_count)
+    .bind(&chain_id)
+    .bind(&number)
+    .bind(&hash)
+    .bind(&parent_hash)
+    .bind(&state_root)
+    .bind(&extrinsics_root)
+    .bind(&spec_version)
+    .bind(&timestamp)
+    .bind(&extrinsic_count)
+    .bind(&event_count)
     .execute(&mut *tx)
     .await?;
 
-    // Note the runtime this block was decoded under, so it is possible to tell after the
-    // fact which metadata produced which rows.
+    Ok(())
+}
+
+/// Note the runtime each block was decoded under, so it is possible to tell after the fact
+/// which metadata produced which rows.
+///
+/// Deduplicated in Rust rather than left to `ON CONFLICT`: a batch normally holds one runtime
+/// for all of its blocks, and `first_seen_block` must come from the *lowest* of them. Blocks
+/// arrive in ascending order, so keeping the first sighting of each `spec_version` is exactly
+/// that — and it matches what the per-block path recorded, which is what makes batching
+/// invisible in the rows.
+async fn insert_runtime_versions(tx: &mut PgConnection, batch: &[BlockData]) -> DbResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    let mut chain_id = Vec::new();
+    let mut spec_version = Vec::new();
+    let mut spec_name = Vec::new();
+    let mut first_seen_block = Vec::new();
+
+    for data in batch {
+        let block = &data.block;
+        if !seen.insert((block.chain_id.as_str(), block.spec_version)) {
+            continue;
+        }
+        chain_id.push(block.chain_id.as_str());
+        spec_version.push(block.spec_version);
+        spec_name.push(data.spec_name.as_str());
+        first_seen_block.push(block.number);
+    }
+
     sqlx::query(
         r#"
         INSERT INTO runtime_versions (chain_id, spec_version, spec_name, first_seen_block)
-        VALUES ($1, $2, $3, $4)
+        SELECT * FROM UNNEST($1::text[], $2::int[], $3::text[], $4::bigint[])
         ON CONFLICT (chain_id, spec_version) DO NOTHING
         "#,
     )
-    .bind(&block.chain_id)
-    .bind(block.spec_version)
-    .bind(&data.spec_name)
-    .bind(block.number)
+    .bind(&chain_id)
+    .bind(&spec_version)
+    .bind(&spec_name)
+    .bind(&first_seen_block)
     .execute(&mut *tx)
     .await?;
-
-    for extrinsic in &data.extrinsics {
-        insert_extrinsic(tx, extrinsic).await?;
-    }
-    for event in &data.events {
-        insert_event(tx, event).await?;
-    }
 
     Ok(())
 }
@@ -175,52 +252,122 @@ pub async fn update_cursor(
     Ok(())
 }
 
-async fn insert_extrinsic(tx: &mut PgConnection, extrinsic: &NewExtrinsic) -> DbResult<()> {
+/// Every extrinsic in the batch, flattened into one insert.
+///
+/// The whole batch is one statement rather than one per block: the round-trip is what costs,
+/// and it is paid per statement, not per row.
+async fn insert_extrinsics(tx: &mut PgConnection, batch: &[BlockData]) -> DbResult<()> {
+    let n: usize = batch.iter().map(|data| data.extrinsics.len()).sum();
+    if n == 0 {
+        return Ok(());
+    }
+
+    let mut chain_id = Vec::with_capacity(n);
+    let mut block_number = Vec::with_capacity(n);
+    let mut idx = Vec::with_capacity(n);
+    let mut hash = Vec::with_capacity(n);
+    let mut pallet = Vec::with_capacity(n);
+    let mut call = Vec::with_capacity(n);
+    let mut signer = Vec::with_capacity(n);
+    let mut is_signed = Vec::with_capacity(n);
+    let mut success = Vec::with_capacity(n);
+    let mut fee = Vec::with_capacity(n);
+    let mut args = Vec::with_capacity(n);
+
+    for extrinsic in batch.iter().flat_map(|data| &data.extrinsics) {
+        chain_id.push(extrinsic.chain_id.as_str());
+        block_number.push(extrinsic.block_number);
+        idx.push(extrinsic.idx);
+        hash.push(extrinsic.hash.as_slice());
+        pallet.push(extrinsic.pallet.as_str());
+        call.push(extrinsic.call.as_str());
+        signer.push(extrinsic.signer.as_deref());
+        is_signed.push(extrinsic.is_signed);
+        success.push(extrinsic.success);
+        fee.push(extrinsic.fee.clone());
+        args.push(&extrinsic.args);
+    }
+
     sqlx::query(
         r#"
         INSERT INTO extrinsics (
             chain_id, block_number, idx, hash, pallet, call,
             signer, is_signed, success, fee, args
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        SELECT * FROM UNNEST(
+            $1::text[], $2::bigint[], $3::int[], $4::bytea[], $5::text[], $6::text[],
+            $7::text[], $8::bool[], $9::bool[], $10::numeric[], $11::jsonb[]
+        )
         ON CONFLICT (chain_id, block_number, idx) DO NOTHING
         "#,
     )
-    .bind(&extrinsic.chain_id)
-    .bind(extrinsic.block_number)
-    .bind(extrinsic.idx)
-    .bind(&extrinsic.hash)
-    .bind(&extrinsic.pallet)
-    .bind(&extrinsic.call)
-    .bind(extrinsic.signer.as_deref())
-    .bind(extrinsic.is_signed)
-    .bind(extrinsic.success)
-    .bind(extrinsic.fee.as_ref())
-    .bind(&extrinsic.args)
+    .bind(&chain_id)
+    .bind(&block_number)
+    .bind(&idx)
+    .bind(&hash)
+    .bind(&pallet)
+    .bind(&call)
+    .bind(&signer)
+    .bind(&is_signed)
+    .bind(&success)
+    .bind(&fee)
+    .bind(&args)
     .execute(&mut *tx)
     .await?;
 
     Ok(())
 }
 
-async fn insert_event(tx: &mut PgConnection, event: &NewEvent) -> DbResult<()> {
+/// Every event in the batch, flattened into one insert.
+///
+/// The one that matters most for throughput: events outnumber extrinsics by an order of
+/// magnitude on a busy block, and they were the bulk of the per-row round-trips.
+async fn insert_events(tx: &mut PgConnection, batch: &[BlockData]) -> DbResult<()> {
+    let n: usize = batch.iter().map(|data| data.events.len()).sum();
+    if n == 0 {
+        return Ok(());
+    }
+
+    let mut chain_id = Vec::with_capacity(n);
+    let mut block_number = Vec::with_capacity(n);
+    let mut idx = Vec::with_capacity(n);
+    let mut pallet = Vec::with_capacity(n);
+    let mut variant = Vec::with_capacity(n);
+    let mut phase = Vec::with_capacity(n);
+    let mut extrinsic_idx = Vec::with_capacity(n);
+    let mut fields = Vec::with_capacity(n);
+
+    for event in batch.iter().flat_map(|data| &data.events) {
+        chain_id.push(event.chain_id.as_str());
+        block_number.push(event.block_number);
+        idx.push(event.idx);
+        pallet.push(event.pallet.as_str());
+        variant.push(event.variant.as_str());
+        phase.push(event.phase.as_str());
+        extrinsic_idx.push(event.extrinsic_idx);
+        fields.push(&event.fields);
+    }
+
     sqlx::query(
         r#"
         INSERT INTO events (
             chain_id, block_number, idx, pallet, variant, phase, extrinsic_idx, fields
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        SELECT * FROM UNNEST(
+            $1::text[], $2::bigint[], $3::int[], $4::text[], $5::text[], $6::text[],
+            $7::int[], $8::jsonb[]
+        )
         ON CONFLICT (chain_id, block_number, idx) DO NOTHING
         "#,
     )
-    .bind(&event.chain_id)
-    .bind(event.block_number)
-    .bind(event.idx)
-    .bind(&event.pallet)
-    .bind(&event.variant)
-    .bind(&event.phase)
-    .bind(event.extrinsic_idx)
-    .bind(&event.fields)
+    .bind(&chain_id)
+    .bind(&block_number)
+    .bind(&idx)
+    .bind(&pallet)
+    .bind(&variant)
+    .bind(&phase)
+    .bind(&extrinsic_idx)
+    .bind(&fields)
     .execute(&mut *tx)
     .await?;
 
