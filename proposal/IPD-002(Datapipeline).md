@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Phases 0, 0.5, 1 and 2 shipped; 3–5 proposed |
+| **Status** | Phases 0, 0.5, 1, 2 and 3 shipped; 4–5 proposed |
 | **Author** | Darwin Subramaniam |
 | **Created** | 2026-08-15 |
 | **Target** | Every chain reached over RPC (`ChainSource::Rpc`) |
@@ -1248,6 +1248,33 @@ When an endpoint's breaker opens, its leased chunks are released back to `pendin
 endpoints pick them up. Losing an endpoint costs throughput, never correctness, and never a
 hole.
 
+> [!IMPORTANT]
+> **The brake bounds a chunk's *end*, not its start.** §6.3 writes the rule as
+> `chunk.from_block < digest_watermark + max_digest_lag`, and that is off by a chunk: a chunk
+> that began inside the state window but finished outside it leaves exactly the blocks at its
+> tail with state the digest can no longer read — which is the whole failure the brake exists
+> to prevent, arriving one chunk later than expected.
+>
+> Bounding the end brings back phase 2's deadlock in a new costume: with `chunk_size` larger
+> than `max_digest_lag`, *no* chunk is ever claimable, and the fetcher waits for a digest that
+> is waiting for a watermark that will never move. So `chunk_size` is clamped to `max_lag`
+> when the lag is bounded. The two rules are load-bearing together and neither is safe alone.
+>
+> **A token is one *block*, not one RPC call.** A block costs a handful of calls, so the
+> effective call rate is a small multiple of `max_rps`. Pacing on the unit the work is
+> measured in is what makes the number predictable to whoever sets it; the alternative —
+> threading a limiter through every subxt call site — buys precision nobody can act on.
+
+> [!NOTE]
+> **Under parallel fetch there is no "the previous block".** §9.4.6 detects a runtime upgrade
+> as `spec(N-1)` disagreeing with the version seen for block N-1, which only holds while
+> blocks are fetched in order. With chunks in flight against several endpoints they are not.
+>
+> The observable equivalent is what shipped: an upgrade is reported when a worker meets a
+> runtime this process has not seen before, which is also exactly when the metadata is
+> archived. Same information, same once-per-runtime frequency, and it survives the blocks
+> arriving in any order.
+
 ---
 
 ## 11. Changes required
@@ -1414,7 +1441,7 @@ a coherent system.
 | **0.5 — Upgrade-block fix** *(done — `543a56f`)* | `decode_at` resolves metadata at the block's parent; `UpgradeBlockBodyUnavailable`; the regression test in `upgrade_boundary.rs` | **Closed a live defect that halted any chain on runtime upgrade** (§9.1.2). Shipped alone, needing none of the rest of this proposal. |
 | **1 — Hot store + split** *(done)* | `pif-store` (segment + metadata), watermark tables, `fetch`/`digest` as two tasks, single endpoint, unbatched writes, the `decode_at` generic-core refactor (§11.3), connection reuse + metadata cache (§9.1), `pif fetch`/`digest`/`replay`/`store status`, `tests/pipeline_split.rs` | Blocks are archived. `pif replay` works for the *dynamic core* — verified against a dead address. Handlers that read storage still hit the network, and say so by name (`StorageNotArchived`) rather than reaching for it silently. |
 | **2 — Storage read cache** *(done)* | `pif_store::StorageCache`, `pif_chain::CachedStorage`, the max-lag brake with an archive-capability probe, `StorageNotArchived`, `ChainNotIndexed` | **Replay is fully offline, handlers included** — `pif replay` no longer opens a connection at all, and a miss is a named error rather than a silent fetch. This is the phase that makes phase 1 mean what it claims. |
-| **3 — Multi-endpoint** | `EndpointPool`, limiter, chunk lease queue, per-endpoint genesis + capability probe, linkage verification | Backfill parallelises across endpoints and survives a 429 or a dead provider. |
+| **3 — Multi-endpoint** *(done)* | `EndpointPool`, `limiter.rs` (token bucket + AIMD + breaker), the chunk lease queue on `fetch_chunks`, per-endpoint genesis + capability probe, `AllEndpointsDown` / `EndpointGenesisMismatch` / `ChunksFailed`. Linkage verification and the capability probe had already landed in phases 1 and 2. | Backfill parallelises across endpoints and survives a 429 or a dead provider. Verified: two endpoints interleave chunks and produce the same chain as one; a dead member is skipped; all of them dead is a named failure. |
 | **4 — Batched digest** | `UNNEST` inserts, K-blocks-per-transaction | The digest stops being the bottleneck phase 3 just created. |
 | **5 — Cold tiering** | `cold.rs`, `segments.tier`, `archive_watermark`, retention policy | History moves SSD → HDD and remains replayable. |
 

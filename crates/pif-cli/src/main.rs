@@ -364,9 +364,24 @@ fn print_store_status(status: &pif_chain::pipeline::StoreStatus) {
     println!("block bytes      {}", human_bytes(status.usage.bytes));
     println!("state bytes      {}", human_bytes(status.reads.bytes));
 
+    let (pending, leased, failed) = status.chunks;
+    if pending + leased + failed > 0 {
+        println!("fetch queue      {pending} pending, {leased} leased, {failed} failed");
+    }
+
     match status.replayable {
         Some((from, to)) => println!("replayable       {from}..={to}"),
         None => println!("replayable       nothing is archived for this chain"),
+    }
+
+    if failed > 0 {
+        // Retrying is the ordinary response to a chunk failing, so a failed chunk means the
+        // range is failing for a reason retrying cannot fix.
+        println!(
+            "  {failed} chunk(s) gave up; see fetch_chunks.last_error for chain \
+             {:?}",
+            status.chain_id
+        );
     }
 
     if !status.runtimes_without_metadata.is_empty() {

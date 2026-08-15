@@ -260,6 +260,57 @@ pub enum ChainError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// Not one configured endpoint for this chain could be reached.
+    ///
+    /// Losing an endpoint costs throughput, never correctness — the pool simply carries on
+    /// with the rest. Losing all of them is the one case that has to stop, because there is
+    /// nothing left to fetch from.
+    #[error(
+        "chain {chain}: none of the {attempted} configured endpoints could be reached.\n\
+         Blocks already archived are unaffected — `pif digest` and `pif replay` still work \
+         against them."
+    )]
+    AllEndpointsDown { chain: String, attempted: usize },
+
+    /// Two endpoints in one pool report different genesis hashes.
+    ///
+    /// They are not the same chain, so nothing they say can be combined. With parallel fetch
+    /// this would not even fail reproducibly: whichever endpoint happened to lease a chunk
+    /// would decide what that range of blocks contained.
+    #[error(
+        "chain {chain}: endpoint {first} reports genesis 0x{first_genesis}, but {other} \
+         reports 0x{other_genesis}.\n\
+         These are different chains. Refusing to fetch one chain's history from the other."
+    )]
+    EndpointGenesisMismatch {
+        chain: String,
+        first: String,
+        other: String,
+        first_genesis: String,
+        other_genesis: String,
+    },
+
+    /// An endpoint's circuit breaker opened mid-chunk.
+    ///
+    /// Not really a failure of the *work*: the chunk goes back on the queue and another
+    /// endpoint picks it up. It travels as an error because that is how a worker abandons a
+    /// chunk it can no longer make progress on.
+    #[error("endpoint {endpoint} is not accepting requests")]
+    EndpointUnavailable { endpoint: String },
+
+    /// Chunks that failed against every endpoint, repeatedly.
+    ///
+    /// Retrying is the ordinary response to a chunk failing, so reaching this means the
+    /// range is failing for a reason retrying cannot fix. `fetch_chunks.last_error` holds
+    /// what each one said.
+    #[error(
+        "chain {chain}: {count} chunk(s) failed on every attempt against every endpoint.\n\
+         Inspect them, then re-queue by resetting the chain's watermarks:\n  \
+           SELECT from_block, to_block, attempts, last_error FROM fetch_chunks\n    \
+            WHERE chain_id = '{chain}' AND state = 'failed';"
+    )]
+    ChunksFailed { chain: String, count: u64 },
+
     #[error("block archive error")]
     Store(#[from] pif_store::StoreError),
 

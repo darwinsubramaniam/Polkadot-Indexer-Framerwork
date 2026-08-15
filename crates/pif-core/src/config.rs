@@ -52,6 +52,14 @@ pub struct PipelineConfig {
     #[serde(default = "default_segment_size")]
     pub segment_size: u64,
 
+    /// Blocks per lease in the fetch work queue.
+    ///
+    /// The unit of parallelism and of retry: a chunk is claimed by one endpoint, archived,
+    /// and marked done as a whole. Smaller chunks spread work more evenly across endpoints
+    /// and lose less to a failure; larger ones spend less time in Postgres per block.
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size: u64,
+
     /// How far the fetch stage may run ahead of the digest, in blocks.
     ///
     /// The brake exists because the storage read cache is filled on the *first* digest of a
@@ -73,11 +81,16 @@ fn default_segment_size() -> u64 {
     1000
 }
 
+fn default_chunk_size() -> u64 {
+    128
+}
+
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             hot_path: default_hot_path(),
             segment_size: default_segment_size(),
+            chunk_size: default_chunk_size(),
             max_digest_lag: None,
         }
     }
@@ -95,13 +108,16 @@ impl Default for PipelineConfig {
 ///   chain's own finality proofs, so it trusts nobody. The trade-off is that it cannot map
 ///   an arbitrary block *number* to a hash — a light client has no way to verify such an
 ///   answer — so it can only follow the finalized head forward from now.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(try_from = "RawChainSource")]
 pub enum ChainSource {
-    /// A WebSocket JSON-RPC endpoint.
+    /// One or more WebSocket JSON-RPC endpoints for the same chain.
     Rpc {
-        /// `ws://` or `wss://` endpoint of a node for this chain.
-        url: String,
+        /// Always at least one, and normalised on load: the file may spell a single endpoint
+        /// as `ws_url`, as `[chains.source] url`, or as a one-element `endpoints` list, and
+        /// everything above this sees the same shape either way.
+        endpoints: Vec<Endpoint>,
     },
 
     /// An in-process smoldot light client.
@@ -125,17 +141,128 @@ pub enum ChainSource {
     },
 }
 
+/// One node serving a chain.
+///
+/// Endpoints are **not interchangeable**, which is why this is a struct rather than a bare
+/// URL: one may keep archived state and another prune it, and one may tolerate twenty calls
+/// a second where another bans you at five. Both facts change what the indexer may ask of it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    /// `ws://` or `wss://`.
+    pub url: String,
+
+    /// Whether this node keeps historical state.
+    ///
+    /// `None` means "probe it at connect", which is the honest default: no RPC reports a
+    /// node's pruning mode, so the only reliable answer comes from asking for old state and
+    /// seeing what happens. Declaring it saves the probe and nothing else.
+    #[serde(default)]
+    pub archive: Option<bool>,
+
+    /// Requests per second this endpoint is believed to tolerate.
+    ///
+    /// A *ceiling* the limiter converges up to, not a rate it drives at: a public endpoint
+    /// will never tell you its real limit, so the limiter backs off on every 429 and creeps
+    /// back afterwards. Omit it and the default ceiling applies.
+    ///
+    /// The fetch stage spends one unit per **block**, not per RPC call — a block costs a
+    /// handful of calls, so the effective call rate is a small multiple of this. Pacing on
+    /// the unit the work is measured in is what makes the number predictable.
+    #[serde(default)]
+    pub max_rps: Option<u32>,
+}
+
+impl Endpoint {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            archive: None,
+            max_rps: None,
+        }
+    }
+}
+
+/// The on-disk spelling of a source, before normalisation.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
+enum RawChainSource {
+    Rpc {
+        /// The original single-endpoint spelling. Still accepted, and still the common case.
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        endpoints: Option<Vec<Endpoint>>,
+    },
+    LightClient {
+        chain_spec: PathBuf,
+        #[serde(default)]
+        relay_chain_spec: Option<PathBuf>,
+        #[serde(default)]
+        bootnodes: Vec<String>,
+    },
+}
+
+impl TryFrom<RawChainSource> for ChainSource {
+    type Error = String;
+
+    fn try_from(raw: RawChainSource) -> std::result::Result<Self, Self::Error> {
+        match raw {
+            RawChainSource::Rpc { url, endpoints } => match (url, endpoints) {
+                (Some(url), None) => Ok(ChainSource::Rpc {
+                    endpoints: vec![Endpoint::new(url)],
+                }),
+                (None, Some(endpoints)) => Ok(ChainSource::Rpc { endpoints }),
+                // Both spellings mean "the endpoints for this chain", and honouring one
+                // while ignoring the other would silently index against a node the operator
+                // thought they had replaced.
+                (Some(_), Some(_)) => {
+                    Err("rpc source: set either `url` or `endpoints`, not both".to_owned())
+                }
+                (None, None) => Err(
+                    "rpc source: no endpoint configured; add `url = \"ws://…\"` or an \
+                     `endpoints` list"
+                        .to_owned(),
+                ),
+            },
+            RawChainSource::LightClient {
+                chain_spec,
+                relay_chain_spec,
+                bootnodes,
+            } => Ok(ChainSource::LightClient {
+                chain_spec,
+                relay_chain_spec,
+                bootnodes,
+            }),
+        }
+    }
+}
+
 impl ChainSource {
     /// A light client can only ever index forward from the current finalized head.
     pub fn can_backfill(&self) -> bool {
         matches!(self, ChainSource::Rpc { .. })
+    }
+
+    /// The endpoints for an rpc source; empty for a light client.
+    pub fn endpoints(&self) -> &[Endpoint] {
+        match self {
+            ChainSource::Rpc { endpoints } => endpoints,
+            ChainSource::LightClient { .. } => &[],
+        }
     }
 }
 
 impl fmt::Display for ChainSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ChainSource::Rpc { url } => write!(f, "{url}"),
+            // Every endpoint, because "which node is this" is exactly what a genesis
+            // mismatch or a connection failure needs to name, and reporting only the first
+            // would point at the wrong one half the time.
+            ChainSource::Rpc { endpoints } => {
+                let urls: Vec<&str> = endpoints.iter().map(|e| e.url.as_str()).collect();
+                write!(f, "{}", urls.join(", "))
+            }
             ChainSource::LightClient { chain_spec, .. } => {
                 write!(f, "light-client:{}", chain_spec.display())
             }
@@ -181,7 +308,9 @@ impl ChainConfig {
     pub fn rpc(id: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             id: id.into(),
-            source: ChainSource::Rpc { url: url.into() },
+            source: ChainSource::Rpc {
+                endpoints: vec![Endpoint::new(url)],
+            },
             start_block: 0,
             handlers: Vec::new(),
             pipeline: None,
@@ -270,7 +399,9 @@ impl TryFrom<RawChainConfig> for ChainConfig {
     fn try_from(raw: RawChainConfig) -> std::result::Result<Self, Self::Error> {
         let source = match (raw.source, raw.ws_url) {
             (Some(source), None) => source,
-            (None, Some(url)) => ChainSource::Rpc { url },
+            (None, Some(url)) => ChainSource::Rpc {
+                endpoints: vec![Endpoint::new(url)],
+            },
             (Some(_), Some(_)) => {
                 return Err(format!(
                     "chain {:?}: set either `ws_url` or a `[chains.source]` table, not both",
@@ -397,12 +528,43 @@ impl IndexerConfig {
             }
 
             match &chain.source {
-                ChainSource::Rpc { url } => {
-                    if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+                ChainSource::Rpc { endpoints } => {
+                    // An empty list parses fine and then connects to nothing, which surfaces
+                    // much later as "this chain never indexed anything".
+                    if endpoints.is_empty() {
                         return Err(Error::ConfigInvalid(format!(
-                            "chain {:?}: rpc url must start with ws:// or wss://, got {:?}",
-                            chain.id, url
+                            "chain {:?}: `endpoints` is empty; a chain needs at least one node",
+                            chain.id
                         )));
+                    }
+
+                    // Checked for *every* endpoint, not just the first: a typo in the third
+                    // entry of a list is exactly the one nobody notices.
+                    for endpoint in endpoints {
+                        if !(endpoint.url.starts_with("ws://")
+                            || endpoint.url.starts_with("wss://"))
+                        {
+                            return Err(Error::ConfigInvalid(format!(
+                                "chain {:?}: rpc url must start with ws:// or wss://, got {:?}",
+                                chain.id, endpoint.url
+                            )));
+                        }
+                        if endpoint.max_rps == Some(0) {
+                            return Err(Error::ConfigInvalid(format!(
+                                "chain {:?}: endpoint {:?} has max_rps = 0, which permits no                                  calls at all; omit it for the default",
+                                chain.id, endpoint.url
+                            )));
+                        }
+                    }
+
+                    let mut seen = std::collections::HashSet::new();
+                    for endpoint in endpoints {
+                        if !seen.insert(&endpoint.url) {
+                            return Err(Error::ConfigInvalid(format!(
+                                "chain {:?}: endpoint {:?} is listed twice; the limiter is                                  per endpoint, so a duplicate would quietly double the rate                                  aimed at one node",
+                                chain.id, endpoint.url
+                            )));
+                        }
                     }
                 }
 
@@ -433,6 +595,12 @@ impl IndexerConfig {
                 if pipeline.hot_path.as_os_str().is_empty() {
                     return Err(Error::ConfigInvalid(format!(
                         "chain {:?}: pipeline.hot_path must not be empty",
+                        chain.id
+                    )));
+                }
+                if pipeline.chunk_size == 0 {
+                    return Err(Error::ConfigInvalid(format!(
+                        "chain {:?}: pipeline.chunk_size must be at least 1",
                         chain.id
                     )));
                 }
@@ -492,7 +660,7 @@ mod tests {
 
     fn rpc_url(chain: &ChainConfig) -> &str {
         match &chain.source {
-            ChainSource::Rpc { url } => url,
+            ChainSource::Rpc { endpoints } => &endpoints[0].url,
             other => panic!("expected an rpc source, got {other:?}"),
         }
     }
@@ -761,6 +929,160 @@ mod tests {
         assert!(err.to_string().contains("does not exist"), "got: {err}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn all_three_spellings_of_one_endpoint_agree() {
+        // `ws_url` is what every config in the wild uses, `[chains.source] url` is the
+        // modern single form, and a one-element `endpoints` list is the multi form degraded.
+        // They must produce the *same value*, not merely all parse.
+        let shorthand = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+            ws_url = "ws://127.0.0.1:9944"
+            "#,
+        )
+        .unwrap();
+
+        let single = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+
+            [chains.source]
+            type = "rpc"
+            url = "ws://127.0.0.1:9944"
+            "#,
+        )
+        .unwrap();
+
+        let listed = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+
+            [chains.source]
+            type = "rpc"
+            endpoints = [{ url = "ws://127.0.0.1:9944" }]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(shorthand.chains[0].source, single.chains[0].source);
+        assert_eq!(single.chains[0].source, listed.chains[0].source);
+        assert_eq!(shorthand.chains[0].source.endpoints().len(), 1);
+    }
+
+    #[test]
+    fn parses_several_endpoints_with_their_capabilities() {
+        let config = parse(
+            r#"
+            [[chains]]
+            id = "polkadot"
+
+            [chains.source]
+            type = "rpc"
+            endpoints = [
+                { url = "wss://rpc-a.example", archive = true,  max_rps = 20 },
+                { url = "wss://rpc-b.example", archive = false, max_rps = 5 },
+                { url = "wss://rpc-c.example" },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let endpoints = config.chains[0].source.endpoints();
+        assert_eq!(endpoints.len(), 3);
+        assert_eq!(endpoints[0].archive, Some(true));
+        assert_eq!(endpoints[0].max_rps, Some(20));
+        assert_eq!(endpoints[1].archive, Some(false));
+        // Undeclared is "probe it", not "assume the worst" — a difference that decides
+        // whether the fetch stage gets a brake.
+        assert_eq!(endpoints[2].archive, None);
+        assert_eq!(endpoints[2].max_rps, None);
+    }
+
+    #[test]
+    fn rejects_both_endpoint_spellings_at_once() {
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+
+            [chains.source]
+            type = "rpc"
+            url = "ws://127.0.0.1:9944"
+            endpoints = [{ url = "ws://127.0.0.1:9945" }]
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(full(&err).contains("not both"), "got: {}", full(&err));
+    }
+
+    #[test]
+    fn rejects_an_empty_endpoint_list() {
+        // Parses fine and then connects to nothing, which would surface much later as
+        // "this chain never indexed anything".
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+
+            [chains.source]
+            type = "rpc"
+            endpoints = []
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("at least one node"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_bad_url_anywhere_in_the_list() {
+        // The third entry, specifically: a check that only looked at the first would pass
+        // this, and the typo would surface as one endpoint mysteriously never being used.
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+
+            [chains.source]
+            type = "rpc"
+            endpoints = [
+                { url = "ws://a.example" },
+                { url = "wss://b.example" },
+                { url = "http://c.example" },
+            ]
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("http://c.example"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_a_duplicated_endpoint() {
+        // The limiter is per endpoint, so listing one twice would aim twice the intended
+        // rate at a single node — the exact thing the limiter exists to avoid.
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+
+            [chains.source]
+            type = "rpc"
+            endpoints = [
+                { url = "wss://a.example" },
+                { url = "wss://a.example" },
+            ]
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("listed twice"), "got: {err}");
     }
 
     #[test]

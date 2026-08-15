@@ -8,8 +8,15 @@
 //!
 //! It follows that an unreadable runtime stops the *digest*, not the fetch: archiving raw
 //! bytes needs no metadata at all, so the backlog keeps accumulating while a fix is built.
+//!
+//! Backfill is parallel across endpoints, through a queue of **leases** rather than
+//! assignments. A worker takes the lowest claimable chunk with `FOR UPDATE SKIP LOCKED`,
+//! archives it, and marks it done; a worker that dies lets its lease expire and the chunk
+//! returns to the pool with nobody having to notice the death. Losing an endpoint therefore
+//! costs throughput and never correctness — and never a hole.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use parity_scale_codec::Encode;
@@ -19,7 +26,7 @@ use pif_store::{HotStore, RawBlock};
 use sqlx::PgPool;
 use subxt::PolkadotConfig;
 
-use crate::client::ChainClient;
+use crate::client::{ChainClient, EndpointPool, PooledEndpoint};
 use crate::decode::{self, AtBlock};
 use crate::error::{ChainError, Result};
 use crate::metadata;
@@ -27,27 +34,33 @@ use crate::metadata;
 /// How long to wait before reconnecting after the block stream drops.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-/// Blocks archived between `fsync`s.
-///
-/// The watermark is advanced only *after* a sync, so it can never claim a block the disk
-/// does not hold — which is what removes any need to reconcile Postgres against the store on
-/// startup. A crash costs at most this many blocks of re-fetching, and re-fetching is
-/// idempotent.
-const SYNC_EVERY: u64 = 64;
+/// How long to wait before re-asking for work when there is none to be had.
+const IDLE_POLL: Duration = Duration::from_millis(250);
 
-/// How long to wait before re-checking the digest watermark while the brake is on.
-const BRAKE_POLL: Duration = Duration::from_millis(250);
+/// How long a worker holds a chunk before it is fair game again.
+///
+/// Long enough that a slow endpoint is not robbed mid-chunk, short enough that a crashed
+/// process does not park work for minutes.
+const LEASE_SECONDS: i32 = 120;
+
+/// Attempts before a chunk is declared failed rather than offered round again.
+///
+/// A chunk that has come back this many times has been tried by every healthy endpoint in
+/// the pool. Offering it again would spin the workers instead of stopping with something a
+/// human can read.
+const MAX_CHUNK_ATTEMPTS: i32 = 5;
 
 /// No brake at all — an archive endpoint serves state at any depth, so there is nothing for
 /// the fetcher to outrun.
 pub const UNBOUNDED_LAG: u64 = u64::MAX;
 
-/// Archives blocks from one chain, holding the connection and the metadata it has seen.
-struct Fetcher<'a> {
-    pool: &'a PgPool,
-    chain: &'a ChainClient,
-    store: &'a HotStore,
-    spec_name: &'a str,
+/// Everything the fetch stage needs that does not change from block to block.
+pub struct Fetch<'a> {
+    pub pool: &'a PgPool,
+    pub config: &'a ChainConfig,
+    pub endpoints: &'a EndpointPool,
+    pub store: &'a HotStore,
+    pub spec_name: &'a str,
     /// How far ahead of the digest this may get, in blocks.
     ///
     /// Not a throughput knob. The storage read cache is filled on the *first* digest of a
@@ -55,138 +68,284 @@ struct Fetcher<'a> {
     /// state the node discarded long ago. The brake makes that structurally impossible
     /// rather than merely unlikely, and it is the same thing that stops the archive growing
     /// without bound when the digest stalls.
-    max_lag: u64,
-    /// Whether the brake has already been reported. Engaging it is normal; saying so every
-    /// 250 ms is not.
-    braked: bool,
-    /// Runtimes already archived in this run. The store is the durable record; this only
-    /// avoids re-asking it once per block.
-    seen: HashSet<u32>,
-    /// The last executing runtime seen, so an upgrade is "these two disagree" rather than a
-    /// separate poll.
-    last_spec: Option<u32>,
-    /// Blocks written since the last `fsync`.
-    unsynced: u64,
+    pub max_lag: u64,
+    /// Blocks per lease.
+    ///
+    /// Clamped to `max_lag` by [`Fetch::effective_chunk_size`]: the brake bounds a chunk's
+    /// *end*, so a chunk larger than the window would never be claimable and the two stages
+    /// would deadlock waiting for each other.
+    pub chunk_size: u64,
 }
 
-impl<'a> Fetcher<'a> {
-    fn new(
-        pool: &'a PgPool,
-        chain: &'a ChainClient,
-        store: &'a HotStore,
-        spec_name: &'a str,
-        max_lag: u64,
-    ) -> Self {
-        Self {
-            pool,
-            chain,
-            store,
-            spec_name,
-            max_lag,
-            braked: false,
-            seen: HashSet::new(),
-            last_spec: None,
-            unsynced: 0,
+/// State shared by every worker on one chain.
+struct Shared {
+    /// Runtimes already archived in this run. Shared so that two workers meeting a new
+    /// runtime at once do not both download 400 KB of metadata for it.
+    seen_runtimes: Mutex<HashSet<u32>>,
+    /// Whether the brake has already been reported. Engaging it is normal; saying so four
+    /// times a second is not.
+    braked: Mutex<bool>,
+}
+
+impl Fetch<'_> {
+    fn chain(&self) -> &ChainInfo {
+        self.endpoints.info()
+    }
+
+    /// Fetch blocks for one chain: catch up to the finalized head, then follow it.
+    pub async fn run(&self, start: u64, stop_at: Option<u64>) -> Result<()> {
+        let target = self
+            .endpoints
+            .head_follower()
+            .client
+            .finalized_number()
+            .await?;
+        let catch_up_end = stop_at.map(|s| s.min(target)).unwrap_or(target);
+
+        tracing::info!(
+            chain = %self.config.id,
+            start,
+            finalized_head = target,
+            endpoints = self.endpoints.len(),
+            "fetch: starting catch-up"
+        );
+
+        if catch_up_end >= start {
+            self.backfill(start, catch_up_end).await?;
         }
-    }
 
-    fn info(&self) -> &ChainInfo {
-        &self.chain.info
-    }
-
-    /// Archive the block at `number`, and make it visible to the digest when it is durable.
-    async fn archive(&mut self, number: u64) -> Result<()> {
-        self.wait_for_digest(number).await?;
-        let at = decode::at_block(&self.chain.client, self.info(), number).await?;
-        self.archive_at(&at).await
-    }
-
-    /// Hold here until the digest is close enough behind that this block's state will still
-    /// exist when the digest asks for it.
-    ///
-    /// A published watermark rather than a channel, so this works whether the digest is the
-    /// other half of `pif index` or a separate `pif digest` process — and so a `pif fetch`
-    /// run with nothing digesting stalls *visibly*, which is the honest outcome rather than
-    /// filling a disk with blocks whose state can never be read.
-    async fn wait_for_digest(&mut self, number: u64) -> Result<()> {
-        if self.max_lag == UNBOUNDED_LAG {
+        if let Some(stop) = stop_at
+            && catch_up_end >= stop
+        {
+            tracing::info!(chain = %self.config.id, stop, "fetch: reached stop_at, finishing");
             return Ok(());
         }
 
+        self.follow_head(stop_at).await
+    }
+
+    /// Archive `start..=end` across every healthy endpoint at once.
+    async fn backfill(&self, start: u64, end: u64) -> Result<()> {
+        let chain_id = &self.chain().id;
+
+        // Anything a previous run left leased is fair game again before we count the work.
+        repo::reclaim_expired_chunks(self.pool, chain_id).await?;
+        let seeded = repo::seed_chunks(
+            self.pool,
+            chain_id,
+            start as i64,
+            end as i64,
+            self.effective_chunk_size() as i64,
+        )
+        .await?;
+        tracing::info!(
+            chain = %self.config.id,
+            seeded,
+            chunk_size = self.effective_chunk_size(),
+            "fetch: queued chunks"
+        );
+
+        let shared = Shared {
+            seen_runtimes: Mutex::new(HashSet::new()),
+            braked: Mutex::new(false),
+        };
+
+        // One worker per endpoint. More would only queue behind the same limiters, since the
+        // limiter is what actually paces each node.
+        let workers = self
+            .endpoints
+            .endpoints()
+            .iter()
+            .map(|endpoint| self.worker(endpoint, &shared, end));
+
+        futures::future::try_join_all(workers).await?;
+
+        let (_, _, failed) = repo::chunk_counts(self.pool, chain_id).await?;
+        if failed > 0 {
+            return Err(ChainError::ChunksFailed {
+                chain: chain_id.clone(),
+                count: failed as u64,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// One endpoint's share of the backfill: claim, archive, complete, repeat.
+    async fn worker(&self, endpoint: &PooledEndpoint, shared: &Shared, end: u64) -> Result<()> {
+        let chain_id = &self.chain().id;
+
         loop {
-            let digested = match repo::load_watermarks(self.pool, &self.info().id).await? {
-                Some(marks) => marks.digest,
-                None => -1,
+            // Asked before claiming, not after: a chunk claimed by an endpoint whose breaker
+            // is open would sit leased until it expired, which is exactly the stall having
+            // several endpoints is meant to avoid.
+            if !endpoint.acquire().await {
+                tokio::time::sleep(IDLE_POLL).await;
+                continue;
+            }
+
+            let ceiling = self.brake_ceiling().await?;
+            let Some(chunk) =
+                repo::claim_chunk(self.pool, chain_id, &endpoint.url, LEASE_SECONDS, ceiling)
+                    .await?
+            else {
+                // Nothing claimable. That is either "all done", "another worker holds the
+                // rest", or "the brake is holding everything back" — and only the first
+                // means this worker can stop.
+                let (pending, leased, _) = repo::chunk_counts(self.pool, chain_id).await?;
+                if pending == 0 && leased == 0 {
+                    return Ok(());
+                }
+                if pending > 0 {
+                    self.report_brake(shared, pending, ceiling);
+                }
+                repo::reclaim_expired_chunks(self.pool, chain_id).await?;
+                tokio::time::sleep(IDLE_POLL).await;
+                continue;
             };
 
-            let ceiling = digested.saturating_add(self.max_lag as i64);
-            if (number as i64) <= ceiling {
-                if self.braked {
-                    tracing::info!(
-                        chain = %self.info().id, block = number, digested,
-                        "fetch: resuming, the digest caught up"
+            match self.archive_chunk(endpoint, shared, &chunk, end).await {
+                Ok(()) => {
+                    endpoint.succeeded();
+                    // Durable first, recorded second: the reverse would let a crash leave
+                    // `fetch_watermark` pointing at blocks the disk never received.
+                    self.store.sync()?;
+                    repo::complete_chunk(self.pool, chain_id, chunk.from_block).await?;
+                    self.advance_watermark().await?;
+
+                    tracing::debug!(
+                        chain = %self.config.id,
+                        endpoint = %endpoint.url,
+                        from = chunk.from_block,
+                        to = chunk.to_block,
+                        rate = endpoint.rate(),
+                        "fetched chunk"
                     );
-                    self.braked = false;
-                }
-                return Ok(());
-            }
-
-            if !self.braked {
-                // Publish before waiting, always. The watermark otherwise advances only
-                // every `SYNC_EVERY` blocks, so a `max_digest_lag` below that would have the
-                // fetcher holding for a digest that is waiting for a watermark this stage
-                // will now never move — the two stages deadlocked, each blocked on the
-                // other. Nothing more is archived while the brake is on, so one publish here
-                // is enough.
-                if self.unsynced > 0 && number > 0 {
-                    self.publish(number - 1).await?;
-                    continue;
                 }
 
-                tracing::warn!(
-                    chain = %self.info().id,
-                    block = number,
-                    digested,
-                    max_digest_lag = self.max_lag,
-                    "fetch: holding for the digest. Archiving further ahead would leave the \
-                     digest asking this endpoint for state it has already pruned. If nothing \
-                     is digesting this chain, start `pif digest` or raise \
-                     pipeline.max_digest_lag."
-                );
-                self.braked = true;
-            }
+                Err(e) => {
+                    endpoint.failed();
 
-            tokio::time::sleep(BRAKE_POLL).await;
+                    // Blocks already written stay written — every insert and every archive
+                    // write is idempotent, so the retry simply overwrites them.
+                    if chunk.attempts >= MAX_CHUNK_ATTEMPTS {
+                        tracing::error!(
+                            chain = %self.config.id, from = chunk.from_block, attempts = chunk.attempts,
+                            error = %e, "chunk failed on every attempt; giving up on it"
+                        );
+                        repo::fail_chunk(self.pool, chain_id, chunk.from_block, &e.to_string())
+                            .await?;
+                    } else {
+                        tracing::warn!(
+                            chain = %self.config.id,
+                            endpoint = %endpoint.url,
+                            from = chunk.from_block,
+                            attempts = chunk.attempts,
+                            error = %e,
+                            "chunk returned to the queue for another endpoint"
+                        );
+                        repo::release_chunk(self.pool, chain_id, chunk.from_block, &e.to_string())
+                            .await?;
+                    }
+                }
+            }
         }
     }
 
-    /// Archive an already-resolved block.
-    async fn archive_at(&mut self, at: &AtBlock) -> Result<()> {
-        let raw = self.capture(at).await?;
-        self.store.put_block(&self.info().id, &raw)?;
-        self.unsynced += 1;
+    async fn archive_chunk(
+        &self,
+        endpoint: &PooledEndpoint,
+        shared: &Shared,
+        chunk: &repo::Chunk,
+        end: u64,
+    ) -> Result<()> {
+        let last = (chunk.to_block as u64).min(end);
 
-        if self.unsynced >= SYNC_EVERY {
-            self.publish(raw.number).await?;
+        for number in chunk.from_block as u64..=last {
+            // One token per block. A block costs a handful of RPC calls, so the effective
+            // call rate is a small multiple of `max_rps` — the useful unit to pace on is the
+            // one the work is measured in.
+            if !endpoint.acquire().await {
+                return Err(ChainError::EndpointUnavailable {
+                    endpoint: endpoint.url.clone(),
+                });
+            }
+
+            let at = decode::at_block(&endpoint.client.client, self.chain(), number).await?;
+            let raw = self.capture(endpoint, shared, &at).await?;
+            self.store.put_block(&self.chain().id, &raw)?;
         }
+
         Ok(())
     }
 
-    /// Make every block archived so far durable, then say so in Postgres.
+    /// Move `fetch_watermark` to the end of the unbroken run of completed chunks.
     ///
-    /// The order is the whole point. Sync first, record second: the reverse would let a
-    /// crash leave `fetch_watermark` pointing at blocks the disk never received, and the
-    /// digest would read a hole as an error rather than a gap it can simply wait out.
-    async fn publish(&mut self, through: u64) -> Result<()> {
-        self.store.sync()?;
-        repo::advance_fetch_watermark(self.pool, &self.info().id, through as i64).await?;
-        self.unsynced = 0;
+    /// Never to the highest *completed* chunk: chunk 12800 can finish before 12700, and a
+    /// digest that treated the higher number as ready would step straight over the hole.
+    async fn advance_watermark(&self) -> Result<()> {
+        if let Some(through) = repo::contiguous_done_end(self.pool, &self.chain().id).await? {
+            repo::advance_fetch_watermark(self.pool, &self.chain().id, through).await?;
+        }
         Ok(())
+    }
+
+    /// Blocks per lease, never more than the brake will let through in one go.
+    fn effective_chunk_size(&self) -> u64 {
+        if self.max_lag == UNBOUNDED_LAG {
+            return self.chunk_size.max(1);
+        }
+        self.chunk_size.min(self.max_lag).max(1)
+    }
+
+    /// The highest block a chunk may *end* at right now, or `None` for no brake.
+    async fn brake_ceiling(&self) -> Result<Option<i64>> {
+        if self.max_lag == UNBOUNDED_LAG {
+            return Ok(None);
+        }
+
+        let digested = match repo::load_watermarks(self.pool, &self.chain().id).await? {
+            Some(marks) => marks.digest,
+            None => -1,
+        };
+
+        Ok(Some(digested.saturating_add(self.max_lag as i64)))
+    }
+
+    /// Say once, and only once, that work exists but the brake is holding it.
+    ///
+    /// A `pif fetch` run with nothing digesting stalls here *visibly*, which is the honest
+    /// outcome: filling a disk with blocks whose state can never be read is worse than
+    /// stopping. Saying so four times a second is not.
+    fn report_brake(&self, shared: &Shared, pending: i64, ceiling: Option<i64>) {
+        let Some(ceiling) = ceiling else { return };
+
+        let mut braked = shared.braked.lock().expect("brake flag poisoned");
+        if *braked {
+            return;
+        }
+        *braked = true;
+
+        tracing::warn!(
+            chain = %self.config.id,
+            pending_chunks = pending,
+            ceiling,
+            max_digest_lag = self.max_lag,
+            "fetch: holding for the digest. Archiving further ahead would leave the digest \
+             asking these endpoints for state they have already pruned. If nothing is \
+             digesting this chain, start `pif digest` or raise pipeline.max_digest_lag."
+        );
     }
 
     /// Build the archive record for one block.
-    async fn capture(&mut self, at: &AtBlock) -> Result<RawBlock> {
+    async fn capture(
+        &self,
+        endpoint: &PooledEndpoint,
+        shared: &Shared,
+        at: &AtBlock,
+    ) -> Result<RawBlock> {
         let number = at.block_number();
+        let client = &endpoint.client;
 
         let header = at
             .block_header()
@@ -201,30 +360,19 @@ impl<'a> Fetcher<'a> {
         // exactly one block per upgrade, and the replay that failed on it would do so long
         // after the mistake could be traced.
         let runtime =
-            decode::executing_runtime(&self.chain.client, self.info(), at, header.parent_hash)
-                .await?;
+            decode::executing_runtime(&client.client, self.chain(), at, header.parent_hash).await?;
         let spec_version = runtime.spec_version();
         let transaction_version = runtime.transaction_version();
 
-        if self
-            .last_spec
-            .is_some_and(|previous| previous != spec_version)
-        {
-            // Routine — Polkadot does roughly one a month — and a non-event for the dynamic
-            // core, which is compiled against no runtime at all. Worth an `info` line so the
-            // boundary is findable, and nothing more.
-            tracing::info!(
-                chain = %self.info().id,
-                block = number,
-                from = self.last_spec.unwrap_or_default(),
-                to = spec_version,
-                "runtime upgrade"
-            );
-        }
-        self.last_spec = Some(spec_version);
-
-        self.ensure_metadata(spec_version, transaction_version, &runtime, number)
-            .await?;
+        self.ensure_metadata(
+            client,
+            shared,
+            spec_version,
+            transaction_version,
+            &runtime,
+            number,
+        )
+        .await?;
 
         let events = at
             .events()
@@ -237,7 +385,7 @@ impl<'a> Fetcher<'a> {
             .bytes()
             .to_vec();
 
-        let extrinsics = self.capture_extrinsics(at, &runtime).await?;
+        let extrinsics = self.capture_extrinsics(client, at, &runtime).await?;
 
         Ok(RawBlock {
             number,
@@ -257,12 +405,16 @@ impl<'a> Fetcher<'a> {
     /// the two differ, and only there is the raw body needed — subxt exposes no way to read
     /// the bytes back out of an `Extrinsics` without first decoding them, which is precisely
     /// what cannot be done there with the wrong metadata.
-    async fn capture_extrinsics(&self, at: &AtBlock, runtime: &AtBlock) -> Result<Vec<Vec<u8>>> {
+    async fn capture_extrinsics(
+        &self,
+        client: &ChainClient,
+        at: &AtBlock,
+        runtime: &AtBlock,
+    ) -> Result<Vec<Vec<u8>>> {
         let number = at.block_number();
 
         if runtime.spec_version() != at.spec_version() {
-            let body = self
-                .chain
+            let body = client
                 .rpc
                 .chain_get_block(Some(at.block_hash()))
                 .await
@@ -271,7 +423,7 @@ impl<'a> Fetcher<'a> {
                     source: Box::new(source),
                 })?
                 .ok_or(ChainError::UpgradeBlockBodyUnavailable {
-                    chain: self.info().id.clone(),
+                    chain: self.chain().id.clone(),
                     number,
                 })?;
 
@@ -313,28 +465,37 @@ impl<'a> Fetcher<'a> {
     /// handful of times a year. Losing one of these makes every block that ran under it
     /// permanently undecodable even though the block bytes are intact.
     async fn ensure_metadata(
-        &mut self,
+        &self,
+        client: &ChainClient,
+        shared: &Shared,
         spec_version: u32,
         transaction_version: u32,
         runtime: &AtBlock,
         first_block: u64,
     ) -> Result<()> {
-        if !self.seen.insert(spec_version) {
-            return Ok(());
+        {
+            let mut seen = shared.seen_runtimes.lock().expect("runtime set poisoned");
+            if !seen.insert(spec_version) {
+                return Ok(());
+            }
+            // Under parallel fetch there is no "the previous block" to compare against, so
+            // an upgrade is reported as what it observably is here: the first block seen
+            // running a runtime this process had not met before. Routine either way — the
+            // dynamic core is compiled against no runtime at all — so `info` and no more.
+            if seen.len() > 1 {
+                tracing::info!(
+                    chain = %self.config.id, block = first_block, spec_version, "runtime upgrade"
+                );
+            }
         }
 
-        let chain_id = self.info().id.clone();
+        let chain_id = self.chain().id.clone();
         if self.store.get_metadata(&chain_id, spec_version)?.is_some() {
             return Ok(());
         }
 
-        let fetched = metadata::fetch_at(
-            &self.chain.rpc,
-            &chain_id,
-            spec_version,
-            runtime.block_hash(),
-        )
-        .await?;
+        let fetched =
+            metadata::fetch_at(&client.rpc, &chain_id, spec_version, runtime.block_hash()).await?;
 
         self.store
             .put_metadata(&chain_id, spec_version, &fetched.bytes)?;
@@ -366,130 +527,89 @@ impl<'a> Fetcher<'a> {
         );
         Ok(())
     }
-}
 
-/// Everything the fetch stage needs that does not change from block to block.
-pub struct Fetch<'a> {
-    pub pool: &'a PgPool,
-    pub config: &'a ChainConfig,
-    pub chain: &'a ChainClient,
-    pub store: &'a HotStore,
-    pub spec_name: &'a str,
-    /// How far ahead of the digest this may get. [`UNBOUNDED_LAG`] for an archive endpoint,
-    /// which can still answer for state at any depth.
-    pub max_lag: u64,
-}
-
-impl Fetch<'_> {
-    /// Fetch blocks for one chain: catch up to the finalized head, then follow it.
-    pub async fn run(&self, start: u64, stop_at: Option<u64>) -> Result<()> {
-        let config = self.config;
-        let mut fetcher = Fetcher::new(
-            self.pool,
-            self.chain,
-            self.store,
-            self.spec_name,
-            self.max_lag,
-        );
-
-        let target = self.chain.finalized_number().await?;
-        let catch_up_end = stop_at.map(|s| s.min(target)).unwrap_or(target);
-        tracing::info!(
-            chain = %config.id, start, finalized_head = target, "fetch: starting catch-up"
-        );
-
-        for number in start..=catch_up_end {
-            fetcher.archive(number).await?;
-
-            if number.is_multiple_of(100) || number == catch_up_end {
-                tracing::info!(chain = %config.id, block = number, "fetched");
-            }
-        }
-
-        if catch_up_end >= start {
-            fetcher.publish(catch_up_end).await?;
-        }
-
-        if let Some(stop) = stop_at
-            && catch_up_end >= stop
-        {
-            tracing::info!(chain = %config.id, stop, "fetch: reached stop_at, finishing");
-            return Ok(());
-        }
-
-        follow_head(self.pool, config, &mut fetcher, stop_at).await
-    }
-}
-
-/// Follow the finalized head, archiving each block as it is finalized.
-///
-/// There is no parallelism to be had here — blocks arrive one every few seconds — and the
-/// archive hop costs well under a millisecond against that. It is done anyway so there is
-/// one code path rather than two, and so the head is as replayable as the history.
-async fn follow_head(
-    pool: &PgPool,
-    config: &ChainConfig,
-    fetcher: &mut Fetcher<'_>,
-    stop_at: Option<u64>,
-) -> Result<()> {
-    loop {
-        let mut blocks = match fetcher.chain.client.stream_blocks().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                tracing::warn!(chain = %config.id, error = %e, "failed to open block stream, retrying");
-                tokio::time::sleep(RECONNECT_DELAY).await;
-                continue;
-            }
+    /// Follow the finalized head, archiving each block as it is finalized.
+    ///
+    /// **One endpoint, not the pool.** A finality subscription is per connection and blocks
+    /// arrive one every few seconds, so there is no parallelism to be had here and several
+    /// subscriptions would only mean several copies of the same block. The archive hop costs
+    /// well under a millisecond against a six-second block time; it is paid so that there is
+    /// one code path rather than two, and so the head is as replayable as the history.
+    async fn follow_head(&self, stop_at: Option<u64>) -> Result<()> {
+        let endpoint = self.endpoints.head_follower();
+        let shared = Shared {
+            seen_runtimes: Mutex::new(HashSet::new()),
+            braked: Mutex::new(false),
         };
+        let chain_id = &self.chain().id;
 
-        tracing::info!(chain = %config.id, "fetch: following finalized head");
-
-        while let Some(block) = blocks.next().await {
-            let block: subxt::client::Block<PolkadotConfig> = match block {
-                Ok(block) => block,
+        loop {
+            let mut blocks = match endpoint.client.client.stream_blocks().await {
+                Ok(stream) => stream,
                 Err(e) => {
-                    tracing::warn!(chain = %config.id, error = %e, "block stream error, reconnecting");
-                    break;
+                    tracing::warn!(chain = %self.config.id, error = %e, "failed to open block stream, retrying");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    continue;
                 }
             };
 
-            let number = block.number();
+            tracing::info!(
+                chain = %self.config.id, endpoint = %endpoint.url, "fetch: following finalized head"
+            );
 
-            // Re-derived from the **fetch** watermark, not the digest's. Reading the digest's
-            // would make the fetcher re-fetch everything the digest has not caught up on yet,
-            // which is the entire backlog on a busy chain.
-            let expected = match repo::load_watermarks(pool, &config.id).await? {
-                Some(marks) => (marks.fetch + 1) as u64,
-                None => number,
-            };
+            while let Some(block) = blocks.next().await {
+                let block: subxt::client::Block<PolkadotConfig> = match block {
+                    Ok(block) => block,
+                    Err(e) => {
+                        tracing::warn!(chain = %self.config.id, error = %e, "block stream error, reconnecting");
+                        break;
+                    }
+                };
 
-            // Already archived — a reconnect can replay the block we stopped on.
-            if number < expected {
-                continue;
+                let number = block.number();
+
+                // Re-derived from the **fetch** watermark, not the digest's. Reading the
+                // digest's would make the fetcher re-fetch everything the digest has not
+                // caught up on yet, which is the entire backlog on a busy chain.
+                let expected = match repo::load_watermarks(self.pool, chain_id).await? {
+                    Some(marks) => (marks.fetch + 1) as u64,
+                    None => number,
+                };
+
+                // Already archived — a reconnect can replay the block we stopped on.
+                if number < expected {
+                    continue;
+                }
+
+                // The stream guarantees it delivers finalized blocks, not that it never skips
+                // one under load. Filling the range keeps the archive gap-free even if it
+                // jumps, and it goes through the same queue so a gap is fetched in parallel
+                // like any other backfill.
+                if expected < number {
+                    self.backfill(expected, number - 1).await?;
+                }
+
+                // Archived from the reference the stream handed us rather than by number:
+                // the hash is already known and pinned, which saves a lookup.
+                let at = decode::at_streamed_block(&block).await?;
+                let raw = self.capture(endpoint, &shared, &at).await?;
+                self.store.put_block(chain_id, &raw)?;
+                self.store.sync()?;
+                repo::advance_fetch_watermark(self.pool, chain_id, number as i64).await?;
+                endpoint.succeeded();
+
+                tracing::debug!(chain = %self.config.id, block = number, "fetched");
+
+                if let Some(stop) = stop_at
+                    && number >= stop
+                {
+                    tracing::info!(chain = %self.config.id, stop, "fetch: reached stop_at, finishing");
+                    return Ok(());
+                }
             }
 
-            // The stream guarantees it delivers finalized blocks, not that it never skips one
-            // under load. Filling the range keeps the archive gap-free even if it jumps.
-            for n in expected..number {
-                fetcher.archive(n).await?;
-            }
-
-            // Archived from the reference the stream handed us rather than by number: the
-            // hash is already known and pinned, which saves a lookup.
-            let at = decode::at_streamed_block(&block).await?;
-            fetcher.archive_at(&at).await?;
-            fetcher.publish(number).await?;
-            tracing::debug!(chain = %config.id, block = number, "fetched");
-
-            if let Some(stop) = stop_at
-                && number >= stop
-            {
-                tracing::info!(chain = %config.id, stop, "fetch: reached stop_at, finishing");
-                return Ok(());
-            }
+            tokio::time::sleep(RECONNECT_DELAY).await;
         }
-
-        tokio::time::sleep(RECONNECT_DELAY).await;
     }
 }
 

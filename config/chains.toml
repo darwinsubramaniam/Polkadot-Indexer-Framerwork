@@ -11,6 +11,21 @@
 #   type = "rpc"                       # somebody's node, over WebSocket
 #   url  = "wss://…"
 #
+#   [chains.source]                    # or several nodes for the same chain
+#   type = "rpc"
+#   endpoints = [
+#       { url = "wss://rpc-a.example", archive = true,  max_rps = 20 },
+#       { url = "wss://rpc-b.example", archive = false, max_rps = 5 },
+#       { url = "wss://rpc-c.example" },     # capabilities probed at connect
+#   ]
+#
+# Endpoints are NOT interchangeable, which is why each is a table rather than a bare URL.
+# One may keep archived state and another prune it; one may tolerate twenty calls a second
+# where another bans you at five. Backfill is spread across all of them through a queue of
+# leases, each paced by its own rate limiter, so losing one costs throughput and never
+# correctness. `archive` and `max_rps` are both optional -- omit them and the indexer probes
+# the node and converges on its limit by backing off whenever it is refused.
+#
 #   [chains.source]
 #   type = "light-client"              # smoldot, in-process, trusts nobody
 #   chain_spec = "specs/polkadot.json"
@@ -53,6 +68,10 @@
 # # number rather than looked up -- which means changing this on an existing store makes
 # # everything already written unfindable. Choose it once.
 # segment_size = 1000
+# # Blocks per lease in the fetch work queue: the unit of parallelism and of retry. A chunk
+# # is claimed by one endpoint, archived, and marked done as a whole. Smaller chunks spread
+# # work more evenly and lose less to a failure; larger ones spend less time in Postgres.
+# chunk_size = 128
 # # How far the fetch stage may run ahead of the digest, in blocks.
 # #
 # # Not a throughput knob. The storage read cache is filled on the FIRST digest of a block,

@@ -14,6 +14,7 @@ pub mod fetch;
 pub mod handlers;
 #[cfg(feature = "light-client")]
 pub mod light_client;
+pub mod limiter;
 pub mod metadata;
 pub mod pipeline;
 pub mod storage;

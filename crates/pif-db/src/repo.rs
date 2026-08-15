@@ -397,6 +397,262 @@ pub async fn advance_digest_watermark(
     Ok(())
 }
 
+/// A range of blocks leased to one fetch worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chunk {
+    pub from_block: i64,
+    pub to_block: i64,
+    /// How many times this chunk has been leased, including now. A chunk that keeps coming
+    /// back is a chunk something is systematically wrong with.
+    pub attempts: i32,
+}
+
+/// Create the work queue for a range, one chunk per `chunk_size` blocks.
+///
+/// Idempotent: chunks already present are left alone, so a restart re-seeds only what is
+/// genuinely new. Tiles forward from `from` rather than aligning to a global grid, because
+/// `from` is always either a chain's start block or one past a completed chunk — never
+/// mid-chunk — so the tiling is stable across runs without an alignment rule to get wrong.
+pub async fn seed_chunks(
+    pool: &PgPool,
+    chain_id: &str,
+    from: i64,
+    to: i64,
+    chunk_size: i64,
+) -> DbResult<u64> {
+    if to < from || chunk_size < 1 {
+        return Ok(0);
+    }
+
+    let mut inserted = 0;
+    let mut start = from;
+    while start <= to {
+        let end = (start + chunk_size - 1).min(to);
+        let result = sqlx::query(
+            r#"
+            INSERT INTO fetch_chunks (chain_id, from_block, to_block, state)
+            VALUES ($1, $2, $3, 'pending')
+            ON CONFLICT (chain_id, from_block) DO NOTHING
+            "#,
+        )
+        .bind(chain_id)
+        .bind(start)
+        .bind(end)
+        .execute(pool)
+        .await?;
+
+        inserted += result.rows_affected();
+        start = end + 1;
+    }
+
+    Ok(inserted)
+}
+
+/// Drop a chain's whole work queue.
+///
+/// Used when the watermarks are reset: a re-index from an arbitrary block would otherwise
+/// tile chunks that overlap the old ones, and overlapping ranges make "the contiguous run of
+/// completed chunks" mean nothing.
+pub async fn reset_chunks(pool: &PgPool, chain_id: &str) -> DbResult<()> {
+    sqlx::query("DELETE FROM fetch_chunks WHERE chain_id = $1")
+        .bind(chain_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Take the lowest claimable chunk, if there is one.
+///
+/// `FOR UPDATE SKIP LOCKED` is what makes several workers — and, later, several *processes*
+/// — safe against each other with no coordinator at all. Two workers asking at the same
+/// instant get different chunks rather than one blocking on the other, and a worker that
+/// dies simply lets its lease expire.
+///
+/// `max_to_block` is the max-lag brake, and it bounds the chunk's **end**, not its start: a
+/// chunk that began inside the window but finished outside it would leave exactly the blocks
+/// at its tail with state the digest can no longer read. Callers keep `chunk_size` at or
+/// below the lag so that the lowest chunk is always claimable — bounding the end with chunks
+/// larger than the window would claim nothing at all, and the two stages would deadlock
+/// waiting for each other.
+pub async fn claim_chunk(
+    pool: &PgPool,
+    chain_id: &str,
+    leased_by: &str,
+    lease_seconds: i32,
+    max_to_block: Option<i64>,
+) -> DbResult<Option<Chunk>> {
+    let row: Option<(i64, i64, i32)> = sqlx::query_as(
+        r#"
+        WITH claimed AS (
+            SELECT from_block
+              FROM fetch_chunks
+             WHERE chain_id = $1
+               AND state = 'pending'
+               AND ($4::bigint IS NULL OR to_block <= $4)
+             ORDER BY from_block
+             FOR UPDATE SKIP LOCKED
+             LIMIT 1
+        )
+        UPDATE fetch_chunks c
+           SET state            = 'leased',
+               leased_by        = $2,
+               lease_expires_at = now() + ($3 * interval '1 second'),
+               attempts         = c.attempts + 1
+          FROM claimed
+         WHERE c.chain_id = $1 AND c.from_block = claimed.from_block
+        RETURNING c.from_block, c.to_block, c.attempts
+        "#,
+    )
+    .bind(chain_id)
+    .bind(leased_by)
+    .bind(lease_seconds)
+    .bind(max_to_block)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(from_block, to_block, attempts)| Chunk {
+        from_block,
+        to_block,
+        attempts,
+    }))
+}
+
+/// Mark a chunk finished. Called only after its blocks are durable on disk.
+///
+/// `leased_by` is *kept*, not cleared: on a done chunk it stops being a lease and becomes the
+/// record of which endpoint actually fetched that range — which is the first thing anyone
+/// asks when one provider turns out to have been serving something odd.
+pub async fn complete_chunk(pool: &PgPool, chain_id: &str, from_block: i64) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE fetch_chunks
+           SET state = 'done', lease_expires_at = NULL, last_error = NULL
+         WHERE chain_id = $1 AND from_block = $2
+        "#,
+    )
+    .bind(chain_id)
+    .bind(from_block)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Hand a chunk back for someone else to try.
+///
+/// The ordinary outcome of an endpoint going down mid-chunk. `attempts` was already
+/// incremented when it was claimed, so a chunk that fails forever is visible in the table
+/// rather than only in the log.
+pub async fn release_chunk(
+    pool: &PgPool,
+    chain_id: &str,
+    from_block: i64,
+    error: &str,
+) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE fetch_chunks
+           SET state = 'pending', leased_by = NULL, lease_expires_at = NULL, last_error = $3
+         WHERE chain_id = $1 AND from_block = $2
+        "#,
+    )
+    .bind(chain_id)
+    .bind(from_block)
+    .bind(error)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Give up on a chunk after too many attempts.
+///
+/// Distinct from releasing it: a chunk that has failed against every endpoint is not going
+/// to succeed by being offered round again, and leaving it pending would spin the workers
+/// forever instead of stopping with something a human can read.
+pub async fn fail_chunk(
+    pool: &PgPool,
+    chain_id: &str,
+    from_block: i64,
+    error: &str,
+) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE fetch_chunks
+           SET state = 'failed', leased_by = NULL, lease_expires_at = NULL, last_error = $3
+         WHERE chain_id = $1 AND from_block = $2
+        "#,
+    )
+    .bind(chain_id)
+    .bind(from_block)
+    .bind(error)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Return chunks whose lease has run out to the pool.
+///
+/// This is the whole recovery story for a worker — or a whole process — that died holding
+/// work: nobody has to notice the death, because the lease expires on its own.
+pub async fn reclaim_expired_chunks(pool: &PgPool, chain_id: &str) -> DbResult<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE fetch_chunks
+           SET state = 'pending', leased_by = NULL, lease_expires_at = NULL
+         WHERE chain_id = $1 AND state = 'leased' AND lease_expires_at < now()
+        "#,
+    )
+    .bind(chain_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// The highest block covered by an unbroken run of completed chunks.
+///
+/// The rule that keeps `fetch_watermark` honest under parallel fetch. Chunk 12800 can finish
+/// before chunk 12700, and a watermark that moved on completion alone would advertise a hole
+/// as ready. Only the prefix counts: everything up to the first chunk that is not `done`.
+pub async fn contiguous_done_end(pool: &PgPool, chain_id: &str) -> DbResult<Option<i64>> {
+    let row: (Option<i64>,) = sqlx::query_as(
+        r#"
+        SELECT max(to_block)
+          FROM fetch_chunks
+         WHERE chain_id = $1
+           AND state = 'done'
+           AND from_block < COALESCE(
+                 (SELECT min(from_block) FROM fetch_chunks
+                   WHERE chain_id = $1 AND state <> 'done'),
+                 9223372036854775807)
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.0)
+}
+
+/// How much work is left: `(pending, leased, failed)`.
+pub async fn chunk_counts(pool: &PgPool, chain_id: &str) -> DbResult<(i64, i64, i64)> {
+    let row: (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT count(*) FILTER (WHERE state = 'pending'),
+               count(*) FILTER (WHERE state = 'leased'),
+               count(*) FILTER (WHERE state = 'failed')
+          FROM fetch_chunks WHERE chain_id = $1
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
 /// Record that a runtime's metadata is in the archive.
 ///
 /// Extends the `runtime_versions` row rather than writing to a table of its own. That table

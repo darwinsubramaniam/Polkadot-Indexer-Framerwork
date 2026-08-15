@@ -34,15 +34,22 @@ Fetching a block and processing it are two separate stages, with a local archive
 them:
 
 ```
-   ┌──────────┐                          ┌──────────┐
-   │  fetch   │──► blocks + metadata ───►│  digest  │──► Postgres
-   └──────────┘                          └──────────┘
-        │                                   │    ▲
-   fetch_watermark ──────────► digest_watermark  │
-                                             ▼    │
-                                   storage reads ─┘
-                              (miss → node, once, ever)
+  endpoint A ─┐
+  endpoint B ─┼─► ┌──────────┐                     ┌──────────┐
+  endpoint C ─┘   │  fetch   │─► blocks+metadata ─►│  digest  │──► Postgres
+                  └──────────┘                     └──────────┘
+                       │                              │    ▲
+                  fetch_watermark ──► digest_watermark │    │
+                                                  ▼    │    │
+                                        storage reads ─┴────┘
+                                   (miss → node, once, ever)
 ```
+
+Backfill is spread across every configured endpoint through a queue of **leases**, not
+assignments: a worker claims the lowest chunk with `FOR UPDATE SKIP LOCKED`, archives it, and
+marks it done. A worker that dies lets its lease expire and the chunk returns to the pool
+with nobody having to notice the death — which is also what makes two `pif fetch` processes
+safe against each other by construction.
 
 The archive holds two things, because **a block archive is not a state archive**. Handlers
 do not read only blocks; they read chain state. `pallet_identity` emits
@@ -79,8 +86,13 @@ Anything the archive cannot answer stops it by name: `BlockNotArchived`,
 > **The fetch stage will not outrun the digest.** The storage read cache is filled on the
 > *first* digest of a block, from a node, so a fetcher far ahead means those reads ask for
 > state the node has already pruned. `max_digest_lag` makes that structurally impossible: it
-> defaults to unbounded against an archive endpoint and 256 otherwise, probed at connect. It
-> is also what stops the archive growing without bound when the digest stalls.
+> defaults to unbounded when *every* endpoint serves archived state and 256 otherwise, probed
+> at connect. It is also what stops the archive growing without bound when the digest stalls.
+
+> **Losing an endpoint costs throughput, never correctness.** A 429 halves that endpoint's
+> permitted rate; repeated failure opens its circuit breaker; its leased chunks go back on
+> the queue and someone else takes them. Losing *all* of them is the one case that stops, and
+> even then the archive is unaffected — `pif digest` and `pif replay` still work against it.
 
 > **Light-client chains are not split.** A split digest resolves each block by *number*, and
 > that is the one question smoldot refuses to answer. Those chains keep the
@@ -418,11 +430,18 @@ therefore run ahead of the data it describes, which is what makes restart-resume
 rather than merely likely. Every insert is `ON CONFLICT DO NOTHING`, so replaying a block is
 a no-op.
 
-**`fetch_watermark` is the highest *contiguous* block, never the highest present.** A digest
-that asked "does block N+1 exist?" would step straight over a hole and record a gap as
-success. It asks `n <= fetch_watermark` instead, and the fetch stage advances that only
-after an `fsync` — so the watermark can never claim a block the disk does not hold, and no
-reconciliation is needed on startup.
+**`fetch_watermark` is the highest *contiguous* block, never the highest present.** Parallel
+fetch means chunk 12 can finish before chunk 8, so a digest that asked "does block N+1
+exist?" would step straight over a hole and record a gap as success. It asks
+`n <= fetch_watermark` instead; that advances only over the unbroken prefix of completed
+chunks, and only after an `fsync` — so the watermark can never claim a block the disk does
+not hold, and no reconciliation is needed on startup.
+
+**The rate limiter is per endpoint, and converges rather than being told.** A shared limiter
+would let the slowest provider throttle the fastest. A configured `max_rps` is a *ceiling*,
+not a rate: the limiter creeps up by a fixed step on success and halves on a 429, because
+additive-increase / multiplicative-decrease is what converges on an unknown limit — and a
+public endpoint will never tell you its real one.
 
 **A block is decoded with the runtime that *executed* it, which is the one at its parent.**
 The block carrying `set_code` runs under the *old* runtime, but its post-state already holds
@@ -527,7 +546,6 @@ driven through the CLI rather than the SDK, and a known multi-node peering limit
 
 ## Not yet implemented
 
-Multi-endpoint fetch with per-endpoint rate limiting, batched multi-row inserts, cold
-tiering of digested segments to a second disk, reorg handling for non-finalized tailing,
-Prometheus metrics, custom `Config` types for Ethereum-style chains (Moonbeam), XCM
-correlation across relay/parachain, and table partitioning by `chain_id`.
+Batched multi-row inserts, cold tiering of digested segments to a second disk, reorg handling
+for non-finalized tailing, Prometheus metrics, custom `Config` types for Ethereum-style chains
+(Moonbeam), XCM correlation across relay/parachain, and table partitioning by `chain_id`.

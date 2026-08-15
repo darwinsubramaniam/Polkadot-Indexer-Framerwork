@@ -19,6 +19,12 @@ use sqlx::{PgPool, Row};
 /// cross a segment boundary at `segment_size = 8`.
 const LAST_BLOCK: u64 = 20;
 
+/// An address nothing is listening on.
+///
+/// Offline and dead-endpoint claims are asserted by *using* this rather than by counting
+/// round-trips: if the code under test still reached for a node, it could not pass.
+const DEAD_URL: &str = "ws://127.0.0.1:1";
+
 /// A chain whose archive lives in a directory of its own, so tests cannot see each other's
 /// segments and a stale run cannot make a later one pass.
 fn chain_config(id: &str, dir: &std::path::Path, handlers: Vec<String>) -> ChainConfig {
@@ -29,6 +35,9 @@ fn chain_config(id: &str, dir: &std::path::Path, handlers: Vec<String>) -> Chain
             // Deliberately tiny: the range above then spans three segment files, so segment
             // rollover is exercised rather than assumed.
             segment_size: 8,
+            // Several chunks across the range below, so parallel claiming is exercised
+            // rather than one worker taking the lot.
+            chunk_size: 4,
             // Probed from the endpoint. On this chain that resolves to 256 — it is too
             // short for the probe to prove the node is archival — which is comfortably
             // above the range below, so the brake never engages here. It is exercised
@@ -202,12 +211,14 @@ async fn a_replay_needs_no_network_at_all() -> Result<()> {
         .execute(&pool)
         .await?;
 
-    let unreachable =
-        ChainConfig::rpc(chain_id, "ws://127.0.0.1:1").with_pipeline(PipelineConfig {
-            hot_path: dir.path().to_path_buf(),
-            segment_size: 8,
-            max_digest_lag: None,
-        });
+    let unreachable = ChainConfig::rpc(chain_id, DEAD_URL).with_pipeline(PipelineConfig {
+        hot_path: dir.path().to_path_buf(),
+        segment_size: 8,
+        // Several chunks across the range below, so parallel claiming is exercised
+        // rather than one worker taking the lot.
+        chunk_size: 4,
+        max_digest_lag: None,
+    });
 
     pipeline::replay(&pool, &unreachable, &pif_e2e::registry(), 0, LAST_BLOCK).await?;
 
@@ -239,6 +250,7 @@ async fn the_fetch_stage_will_not_outrun_the_digest() -> Result<()> {
     let config = ChainConfig::rpc(chain_id, dev_node_url()).with_pipeline(PipelineConfig {
         hot_path: dir.path().to_path_buf(),
         segment_size: 8,
+        chunk_size: 4,
         max_digest_lag: Some(LAG),
     });
 
@@ -301,6 +313,7 @@ async fn a_tight_brake_does_not_deadlock_the_two_stages() -> Result<()> {
     let config = ChainConfig::rpc(chain_id, dev_node_url()).with_pipeline(PipelineConfig {
         hot_path: dir.path().to_path_buf(),
         segment_size: 8,
+        chunk_size: 4,
         max_digest_lag: Some(3),
     });
 
@@ -446,11 +459,14 @@ async fn a_state_reading_handler_replays_with_no_network() -> Result<()> {
     let mut registry = pif_chain::HandlerRegistry::new();
     registry.register(Box::new(handler));
 
-    let unreachable = ChainConfig::rpc(chain_id, "ws://127.0.0.1:1")
+    let unreachable = ChainConfig::rpc(chain_id, DEAD_URL)
         .with_handlers(handlers)
         .with_pipeline(PipelineConfig {
             hot_path: dir.path().to_path_buf(),
             segment_size: 8,
+            // Several chunks across the range below, so parallel claiming is exercised
+            // rather than one worker taking the lot.
+            chunk_size: 4,
             max_digest_lag: None,
         });
 
@@ -496,11 +512,14 @@ async fn an_unarchived_storage_read_stops_a_replay_by_name() -> Result<()> {
     let mut registry = pif_chain::HandlerRegistry::new();
     registry.register(Box::new(handler));
 
-    let config = ChainConfig::rpc(chain_id, "ws://127.0.0.1:1")
+    let config = ChainConfig::rpc(chain_id, DEAD_URL)
         .with_handlers(vec![StateReadingHandler::NAME.to_owned()])
         .with_pipeline(PipelineConfig {
             hot_path: dir.path().to_path_buf(),
             segment_size: 8,
+            // Several chunks across the range below, so parallel claiming is exercised
+            // rather than one worker taking the lot.
+            chunk_size: 4,
             max_digest_lag: None,
         });
 
@@ -512,6 +531,183 @@ async fn an_unarchived_storage_read_stops_a_replay_by_name() -> Result<()> {
     assert!(
         text.contains("Timestamp.Now"),
         "the error should name the read that was wanted, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// A chain fetched across several endpoints at once.
+///
+/// Two spellings of the same node's address, which is enough to exercise everything the pool
+/// actually does — two independent connections, two limiters, two workers claiming from one
+/// lease queue — without needing two nodes that agree on a chain. What it does *not* cover is
+/// endpoints with different capabilities; that is what the `archive` and `max_rps` fields are
+/// for, and they are unit-tested in the config and limiter.
+fn multi_endpoint_config(id: &str, dir: &std::path::Path, urls: &[&str]) -> ChainConfig {
+    ChainConfig {
+        id: id.to_owned(),
+        source: pif_core::ChainSource::Rpc {
+            endpoints: urls
+                .iter()
+                .map(|url| pif_core::Endpoint::new(*url))
+                .collect(),
+        },
+        start_block: 0,
+        handlers: Vec::new(),
+        pipeline: Some(PipelineConfig {
+            hot_path: dir.to_path_buf(),
+            segment_size: 8,
+            chunk_size: 4,
+            max_digest_lag: None,
+        }),
+    }
+}
+
+/// Backfill across several endpoints must produce exactly what one endpoint produces.
+///
+/// Parallel fetch is where a hole becomes easy: chunk 12 can finish before chunk 8, so a
+/// watermark that moved on completion alone would advertise a gap as ready. This indexes the
+/// same range twice — once through one endpoint, once through two — and requires the rows to
+/// match and the chain to be contiguous.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn several_endpoints_produce_the_same_chain_as_one() -> Result<()> {
+    let pool = pool().await?;
+
+    let single_id = "e2e-one-endpoint";
+    let single_dir = tempfile::tempdir()?;
+    reset(&pool, single_id).await?;
+    pipeline::run(
+        &pool,
+        &chain_config(single_id, single_dir.path(), vec![]),
+        &pif_e2e::registry(),
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+
+    let multi_id = "e2e-many-endpoints";
+    let multi_dir = tempfile::tempdir()?;
+    reset(&pool, multi_id).await?;
+    let urls = [
+        dev_node_url(),
+        dev_node_url().replace("127.0.0.1", "localhost"),
+    ];
+    pipeline::run(
+        &pool,
+        &multi_endpoint_config(
+            multi_id,
+            multi_dir.path(),
+            &[urls[0].as_str(), urls[1].as_str()],
+        ),
+        &pif_e2e::registry(),
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        snapshot(&pool, multi_id).await?,
+        snapshot(&pool, single_id).await?,
+        "fetching across two endpoints must yield the same chain as fetching across one"
+    );
+    assert_eq!(
+        pif_db::repo::count_gaps(&pool, multi_id).await?,
+        0,
+        "parallel chunks left a hole"
+    );
+
+    // Every completed chunk records which endpoint fetched it. *Which* endpoint won which
+    // chunk is a race between two workers and deliberately not asserted — printed instead,
+    // because a flaky assertion about scheduling would be worse than none.
+    let attributed: Vec<(i64, String)> = sqlx::query(
+        "SELECT from_block, leased_by FROM fetch_chunks
+          WHERE chain_id = $1 AND state = 'done' ORDER BY from_block",
+    )
+    .bind(multi_id)
+    .fetch_all(&pool)
+    .await?
+    .into_iter()
+    .map(|r| (r.get(0), r.get::<Option<String>, _>(1).unwrap_or_default()))
+    .collect();
+
+    assert!(!attributed.is_empty(), "no chunks were completed at all");
+    assert!(
+        attributed.iter().all(|(_, endpoint)| !endpoint.is_empty()),
+        "a completed chunk does not record which endpoint fetched it: {attributed:?}"
+    );
+    println!("chunk -> endpoint: {attributed:?}");
+
+    Ok(())
+}
+
+/// One dead endpoint must cost throughput and nothing else.
+///
+/// Losing an endpoint is the ordinary condition this design exists for. The pool logs it,
+/// drops it, and carries on with the rest — so the range still gets archived, in full, by
+/// whoever is left.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn a_dead_endpoint_does_not_stop_the_others() -> Result<()> {
+    let pool = pool().await?;
+    let dir = tempfile::tempdir()?;
+    let chain_id = "e2e-dead-endpoint";
+    reset(&pool, chain_id).await?;
+
+    let live = dev_node_url();
+    let config = multi_endpoint_config(chain_id, dir.path(), &[DEAD_URL, live.as_str()]);
+
+    pipeline::run(
+        &pool,
+        &config,
+        &pif_e2e::registry(),
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+
+    assert_eq!(count_blocks(&pool, chain_id).await?, LAST_BLOCK as i64 + 1);
+    assert_eq!(pif_db::repo::count_gaps(&pool, chain_id).await?, 0);
+
+    Ok(())
+}
+
+/// Losing *every* endpoint is the one case that has to stop.
+///
+/// Named rather than generic, because the operator's next move differs: blocks already
+/// archived are unaffected, and `pif digest` and `pif replay` still work against them.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn no_reachable_endpoint_is_a_named_failure() -> Result<()> {
+    let pool = pool().await?;
+    let dir = tempfile::tempdir()?;
+    let chain_id = "e2e-all-endpoints-down";
+    reset(&pool, chain_id).await?;
+
+    let config = multi_endpoint_config(chain_id, dir.path(), &[DEAD_URL, "ws://127.0.0.1:2"]);
+
+    let error = pipeline::run(
+        &pool,
+        &config,
+        &pif_e2e::registry(),
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await
+    .expect_err("with nothing reachable there is nothing to fetch from");
+
+    let text = error.to_string();
+    assert!(
+        text.contains("none of the 2 configured endpoints"),
+        "expected a named all-endpoints-down failure, got: {text}"
     );
 
     Ok(())

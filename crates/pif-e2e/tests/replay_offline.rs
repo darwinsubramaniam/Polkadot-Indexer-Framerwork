@@ -160,6 +160,7 @@ async fn the_identity_handler_replays_with_no_network() -> Result<()> {
     let pipeline_config = PipelineConfig {
         hot_path: archive.path().to_path_buf(),
         segment_size: 64,
+        chunk_size: 16,
         max_digest_lag: None,
     };
 

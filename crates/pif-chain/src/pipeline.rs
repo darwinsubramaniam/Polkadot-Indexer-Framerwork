@@ -17,7 +17,7 @@ use pif_db::repo;
 use pif_store::{HotStore, StorageCache};
 use sqlx::PgPool;
 
-use crate::client::ChainClient;
+use crate::client::{ChainClient, EndpointPool};
 use crate::decode::{self, AtBlock};
 use crate::error::{ChainError, Result};
 use crate::handlers::{BlockContext, HandlerRegistry, Selected};
@@ -61,22 +61,31 @@ pub async fn run(
         });
     }
 
-    let Connected {
-        client: chain,
-        spec_name,
-    } = connect_and_identify(pool, config).await?;
-
-    // Selection happens after connecting because `supports()` inspects the real chain.
-    let handlers = &registry.select(&config.handlers, &chain.info)?;
-
     // A light client cannot resolve a block *number* at all, so there is nothing to catch
-    // up from: it starts at whatever the finality subscription hands it first.
+    // up from: it starts at whatever the finality subscription hands it first, and there is
+    // no pool to build because smoldot cannot participate in the chunk queue at all.
     if !config.can_backfill() {
+        let Connected {
+            client: chain,
+            spec_name,
+        } = connect_and_identify(pool, config).await?;
+        let handlers = &registry.select(&config.handlers, &chain.info)?;
         return follow_only(pool, config, &chain, handlers, &spec_name, &options).await;
     }
 
+    let endpoints = EndpointPool::connect_all(config).await?;
+    let chain = endpoints.head_follower();
+    tracing::info!(chain = %chain.client.info, endpoints = endpoints.len(), "connected");
+
+    guard_chain_identity(pool, config, &chain.client).await?;
+    repo::upsert_chain(pool, &chain.client.info).await?;
+    let spec_name = spec_name_of(&chain.client).await?;
+
+    // Selection happens after connecting because `supports()` inspects the real chain.
+    let handlers = &registry.select(&config.handlers, endpoints.info())?;
+
     let archives = open_archives(config)?;
-    let max_lag = resolve_max_lag(config, &chain).await?;
+    let max_lag = resolve_max_lag(config, &endpoints).await?;
 
     let start = resolve_start(pool, config, options.from).await?;
 
@@ -88,11 +97,11 @@ pub async fn run(
     // `start_block = 0` snapshot genesis, which is empty — correct, and cheap.
     if !handlers.is_empty() {
         let snapshot_at = start.saturating_sub(1);
-        let at = decode::at_block(&chain.client, &chain.info, snapshot_at).await?;
-        let storage = SubxtStorage::new(&at, &chain.info.id);
+        let at = decode::at_block(&chain.client.client, endpoints.info(), snapshot_at).await?;
+        let storage = SubxtStorage::new(&at, &endpoints.info().id);
 
         tracing::info!(chain = %config.id, block = snapshot_at, "bootstrapping handlers");
-        handlers.bootstrap(&chain.info, &storage, pool).await?;
+        handlers.bootstrap(endpoints.info(), &storage, pool).await?;
     }
 
     // Two loops, run concurrently rather than spawned: `Selected` borrows the registry, and
@@ -101,21 +110,24 @@ pub async fn run(
     // against a watermark that will never move again.
     let digest = digest::Digest {
         pool,
-        chain: &chain.info,
+        chain: endpoints.info(),
         store: &archives.blocks,
         reads: &archives.reads,
         handlers,
-        live: Some(&chain),
+        // Storage reads go to the head-follower, which is an archive endpoint when the pool
+        // has one: a pruned node answers for blocks perfectly well but not for their state.
+        live: Some(&chain.client),
         spec_name: &spec_name,
     };
 
     let fetch = fetch::Fetch {
         pool,
         config,
-        chain: &chain,
+        endpoints: &endpoints,
         store: &archives.blocks,
         spec_name: &spec_name,
         max_lag,
+        chunk_size: config.pipeline().chunk_size,
     };
 
     tokio::try_join!(
@@ -131,18 +143,25 @@ pub async fn run(
 /// Useful on its own: it needs no handlers, decodes nothing, and therefore keeps running
 /// through a runtime the digest cannot yet read.
 pub async fn fetch_only(pool: &PgPool, config: &ChainConfig, options: IndexOptions) -> Result<()> {
-    let chain = connect_and_identify(pool, config).await?;
+    let endpoints = EndpointPool::connect_all(config).await?;
+    let chain = endpoints.head_follower();
+
+    guard_chain_identity(pool, config, &chain.client).await?;
+    repo::upsert_chain(pool, endpoints.info()).await?;
+    let spec_name = spec_name_of(&chain.client).await?;
+
     let archives = open_archives(config)?;
-    let max_lag = resolve_max_lag(config, &chain.client).await?;
+    let max_lag = resolve_max_lag(config, &endpoints).await?;
     let start = resolve_start(pool, config, options.from).await?;
 
     fetch::Fetch {
         pool,
         config,
-        chain: &chain.client,
+        endpoints: &endpoints,
         store: &archives.blocks,
-        spec_name: &chain.spec_name,
+        spec_name: &spec_name,
         max_lag,
+        chunk_size: config.pipeline().chunk_size,
     }
     .run(start, options.stop_at)
     .await
@@ -166,6 +185,7 @@ pub async fn digest_only(
     let start = match options.from {
         Some(from) => {
             repo::reset_watermarks(pool, &config.id, before(from)).await?;
+            repo::reset_chunks(pool, &config.id).await?;
             from
         }
         None => match repo::load_watermarks(pool, &config.id).await? {
@@ -251,6 +271,8 @@ pub struct StoreStatus {
     /// Every row written before the archive existed is in here. Not a gap to be embarrassed
     /// about: it is the precise answer to "which ranges can I actually replay?".
     pub runtimes_without_metadata: Vec<(i32, i64)>,
+    /// Fetch work outstanding, as `(pending, leased, failed)`.
+    pub chunks: (i64, i64, i64),
 }
 
 /// Report what the archive holds for one chain — `pif store status`.
@@ -275,6 +297,7 @@ pub async fn store_status(pool: &PgPool, config: &ChainConfig) -> Result<StoreSt
         reads: archives.reads.usage(&config.id)?,
         replayable,
         runtimes_without_metadata: repo::runtimes_without_metadata(pool, &config.id).await?,
+        chunks: repo::chunk_counts(pool, &config.id).await?,
     })
 }
 
@@ -410,16 +433,19 @@ fn open_archives(config: &ChainConfig) -> Result<Archives> {
 /// the brake necessary: the storage read cache is filled from a node on the first digest of
 /// each block, so the fetcher may only outrun the digest as far as that node can still
 /// answer for.
-async fn resolve_max_lag(config: &ChainConfig, chain: &ChainClient) -> Result<u64> {
+async fn resolve_max_lag(config: &ChainConfig, endpoints: &EndpointPool) -> Result<u64> {
     if let Some(configured) = config.pipeline().max_digest_lag {
         tracing::info!(chain = %config.id, max_digest_lag = configured, "fetch: lag from config");
         return Ok(configured);
     }
 
-    if chain.is_archive().await? {
+    // *Every* endpoint, not any: a chunk can be leased by any of them, so one pruned member
+    // sets the pace for the whole pool.
+    if endpoints.all_archive() {
         tracing::info!(
             chain = %config.id,
-            "endpoint serves archived state; the fetch stage may run as far ahead as it likes"
+            endpoints = endpoints.len(),
+            "every endpoint serves archived state; the fetch stage may run as far ahead as it likes"
         );
         return Ok(fetch::UNBOUNDED_LAG);
     }
@@ -453,6 +479,10 @@ fn before(start: u64) -> i64 {
 async fn resolve_start(pool: &PgPool, config: &ChainConfig, from: Option<u64>) -> Result<u64> {
     if let Some(from) = from {
         repo::reset_watermarks(pool, &config.id, before(from)).await?;
+        // The work queue goes with them. Re-seeding from an arbitrary block would otherwise
+        // tile chunks that overlap the old ones, and overlapping ranges make "the contiguous
+        // run of completed chunks" — which is what `fetch_watermark` is — mean nothing.
+        repo::reset_chunks(pool, &config.id).await?;
         return Ok(from);
     }
 
