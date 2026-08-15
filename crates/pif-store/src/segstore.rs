@@ -8,10 +8,17 @@
 //! What sits *above* this differs entirely: a block is one record per number, while a
 //! block's storage reads are a set of them. That is why this layer deals in opaque payloads
 //! and knows nothing about either shape.
+//!
+//! There are up to two roots: the hot tier, and an optional cold one. **Writes only ever go
+//! to the hot tier**; reads try hot first and fall through to cold. That asymmetry is the
+//! whole of tiering as far as this layer is concerned — a segment that has moved is found in
+//! the other place, and nothing above here has to know which tier answered.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::cold::{self, SegmentSpan, Tiered};
 use crate::error::{Result, StoreError};
 use crate::layout;
 use crate::segment::{SegmentReader, SegmentWriter};
@@ -22,6 +29,8 @@ const COMPRESSION_LEVEL: i32 = 3;
 
 pub(crate) struct Segments {
     root: PathBuf,
+    /// Where digested segments are moved to. `None` keeps everything hot.
+    cold: Option<PathBuf>,
     /// Subdirectory under `<root>/<chain_id>` — [`layout::BLOCKS`] or [`layout::STORAGE`].
     kind: &'static str,
     segment_size: u64,
@@ -30,7 +39,7 @@ pub(crate) struct Segments {
     writer: Mutex<Option<Active<SegmentWriter>>>,
     /// The segment most recently read from. The digest walks blocks in order, so one slot
     /// serves nearly every read.
-    reader: Mutex<Option<Active<SegmentReader>>>,
+    reader: Mutex<Option<CachedReader>>,
 }
 
 struct Active<T> {
@@ -45,6 +54,23 @@ impl<T> Active<T> {
     }
 }
 
+/// The open reader, and which tier it came from.
+///
+/// The tier matters because appends only ever land hot: a reader open on a segment's cold
+/// copy cannot be topped up from a write it never saw, so it has to be reopened instead.
+struct CachedReader {
+    chain: String,
+    index: u64,
+    inner: SegmentReader,
+    hot: bool,
+}
+
+impl CachedReader {
+    fn matches(&self, chain: &str, index: u64) -> bool {
+        self.index == index && self.chain == chain
+    }
+}
+
 /// What one kind of store occupies on disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -53,14 +79,27 @@ pub struct Usage {
 }
 
 impl Segments {
-    pub(crate) fn new(root: PathBuf, kind: &'static str, segment_size: u64) -> Result<Self> {
+    pub(crate) fn new(
+        root: PathBuf,
+        cold: Option<PathBuf>,
+        kind: &'static str,
+        segment_size: u64,
+    ) -> Result<Self> {
         if segment_size == 0 {
             return Err(StoreError::InvalidSegmentSize);
         }
         std::fs::create_dir_all(&root).map_err(StoreError::io("creating store root", &root))?;
+        if let Some(cold) = &cold {
+            if *cold == root {
+                return Err(StoreError::ColdPathIsHotPath(root));
+            }
+            std::fs::create_dir_all(cold)
+                .map_err(StoreError::io("creating the cold store root", cold))?;
+        }
 
         Ok(Self {
             root,
+            cold,
             kind,
             segment_size,
             writer: Mutex::new(None),
@@ -72,11 +111,19 @@ impl Segments {
         &self.root
     }
 
+    pub(crate) fn cold_root(&self) -> Option<&Path> {
+        self.cold.as_deref()
+    }
+
     pub(crate) fn segment_size(&self) -> u64 {
         self.segment_size
     }
 
     /// Append one record. Not durable on return — see [`Segments::sync`].
+    ///
+    /// Always to the hot tier. A block whose segment has already been tiered and is written
+    /// again — a re-fetch over old ground — lands hot and shadows the cold copy, which is
+    /// the same rule reads follow.
     pub(crate) fn put(&self, chain: &str, number: u64, payload: &[u8]) -> Result<()> {
         let index = layout::segment_index(number, self.segment_size);
         let compressed = zstd::stream::encode_all(payload, COMPRESSION_LEVEL)
@@ -112,14 +159,22 @@ impl Segments {
         // appending a second record for the same number, and re-fetching a block does the
         // same. Topping the reader up costs only the bytes just written; invalidating it
         // instead would make every digest read reopen the file it is walking through.
-        if let Some(reader) = self
-            .reader
-            .lock()
-            .expect("store reader lock poisoned")
-            .as_mut()
+        //
+        // A reader that is open on the *cold* copy of this segment is dropped instead: it
+        // cannot be topped up from a file the write did not touch.
+        let mut reader_slot = self.reader.lock().expect("store reader lock poisoned");
+        let mut superseded = false;
+        if let Some(reader) = reader_slot.as_mut()
             && reader.matches(chain, index)
         {
-            reader.inner.refresh()?;
+            if reader.hot {
+                reader.inner.refresh()?;
+            } else {
+                superseded = true;
+            }
+        }
+        if superseded {
+            *reader_slot = None;
         }
 
         Ok(())
@@ -205,13 +260,13 @@ impl Segments {
     /// The lowest number this chain holds, if any.
     ///
     /// Found from the segment file names — which are the range they cover — rather than by
-    /// scanning, because the layout puts that information in the path on purpose.
+    /// scanning, because the layout puts that information in the path on purpose. Both tiers
+    /// count: a tiered segment is still archived, and a replay reads it back.
     pub(crate) fn first_number(&self, chain: &str) -> Result<Option<u64>> {
         let mut lowest: Option<u64> = None;
         self.for_each_segment(chain, |name, _| {
-            if let Some(stem) = name.strip_suffix(".seg")
-                && let Some((from, _)) = stem.split_once('-')
-                && let Ok(from) = from.parse::<u64>()
+            if name.ends_with(".seg")
+                && let Some(from) = layout::stem_start(name)
             {
                 let index = layout::segment_index(from, self.segment_size);
                 lowest = Some(lowest.map_or(index, |current: u64| current.min(index)));
@@ -233,49 +288,148 @@ impl Segments {
             .flatten())
     }
 
+    /// What this chain occupies on the hot tier.
     pub(crate) fn usage(&self, chain: &str) -> Result<Usage> {
+        self.usage_of(&self.root, chain)
+    }
+
+    /// What this chain occupies on the cold tier, or nothing when there is none.
+    pub(crate) fn cold_usage(&self, chain: &str) -> Result<Usage> {
+        match &self.cold {
+            Some(cold) => self.usage_of(cold, chain),
+            None => Ok(Usage::default()),
+        }
+    }
+
+    /// Every segment on the hot tier, ascending — what the tiering task decides over.
+    ///
+    /// Read from the directory rather than from a table: the file name *is* the range it
+    /// covers, so a listing cannot disagree with the store the way a record of it could.
+    pub(crate) fn hot_segments(&self, chain: &str) -> Result<Vec<SegmentSpan>> {
+        let dir = layout::segment_dir(&self.root, chain, self.kind)?;
+        let mut spans = Vec::new();
+
+        for_each_file(&dir, |name, entry| {
+            if !name.ends_with(".seg") {
+                return Ok(());
+            }
+            let Some(from) = layout::stem_start(name) else {
+                return Ok(());
+            };
+            let index = layout::segment_index(from, self.segment_size);
+            spans.push(SegmentSpan {
+                index,
+                from_block: layout::segment_start(index, self.segment_size),
+                to_block: layout::segment_end(index, self.segment_size),
+                modified: entry.metadata().ok().and_then(|m| m.modified().ok()),
+            });
+            Ok(())
+        })?;
+
+        spans.sort_by_key(|span| span.index);
+        Ok(spans)
+    }
+
+    /// Copy one segment to the cold tier and verify it landed intact.
+    ///
+    /// The hot copy is deliberately **left in place**: the caller records the move first and
+    /// calls [`Segments::drop_hot`] afterwards, so a crash between the two leaves two copies
+    /// rather than none.
+    pub(crate) fn copy_to_cold(&self, chain: &str, index: u64) -> Result<Tiered> {
+        let Some(cold) = &self.cold else {
+            return Err(StoreError::NoColdTier);
+        };
+
+        let (hot_seg, hot_idx) =
+            layout::segment_paths(&self.root, chain, self.kind, index, self.segment_size)?;
+        let (cold_seg, cold_idx) =
+            layout::segment_paths(cold, chain, self.kind, index, self.segment_size)?;
+
+        let (seg_bytes, checksum) = cold::copy_verified(&hot_seg, &cold_seg)?;
+        // The sidecar is a rebuildable index, not data — but copying it turns a cold read
+        // from a full scan into a seek, and it is a fraction of a percent of the bytes.
+        let idx_bytes = if hot_idx.exists() {
+            cold::copy_verified(&hot_idx, &cold_idx)?.0
+        } else {
+            0
+        };
+
+        Ok(Tiered {
+            span: SegmentSpan {
+                index,
+                from_block: layout::segment_start(index, self.segment_size),
+                to_block: layout::segment_end(index, self.segment_size),
+                modified: None,
+            },
+            bytes: seg_bytes + idx_bytes,
+            checksum: checksum.to_be_bytes().to_vec(),
+        })
+    }
+
+    /// Delete one segment from the hot tier, returning the bytes reclaimed.
+    ///
+    /// Any cached handle on it is dropped first. On Unix an open descriptor keeps reading the
+    /// unlinked inode, so a stale reader would keep answering from a file nobody can see —
+    /// correct bytes, but it would hide the move from everything that checks a tier.
+    pub(crate) fn drop_hot(&self, chain: &str, index: u64) -> Result<u64> {
+        {
+            let mut slot = self.writer.lock().expect("store writer lock poisoned");
+            if slot.as_ref().is_some_and(|w| w.matches(chain, index)) {
+                let mut active = slot.take().expect("just checked");
+                active.inner.sync()?;
+            }
+        }
+        {
+            let mut slot = self.reader.lock().expect("store reader lock poisoned");
+            if slot.as_ref().is_some_and(|r| r.matches(chain, index)) {
+                *slot = None;
+            }
+        }
+
+        let (seg, idx) =
+            layout::segment_paths(&self.root, chain, self.kind, index, self.segment_size)?;
+        Ok(cold::remove(&seg)? + cold::remove(&idx)?)
+    }
+
+    fn usage_of(&self, root: &Path, chain: &str) -> Result<Usage> {
+        let dir = layout::segment_dir(root, chain, self.kind)?;
         let mut usage = Usage::default();
-        self.for_each_segment(chain, |name, len| {
+        for_each_file(&dir, |name, entry| {
             if name.ends_with(".seg") {
                 usage.segments += 1;
             }
-            usage.bytes += len;
+            usage.bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
             Ok(())
         })?;
         Ok(usage)
     }
 
-    /// Visit every file in this chain's segment directory. A directory that does not exist
-    /// yet is an empty store, not a failure.
+    /// Visit every segment file this chain has on either tier, hot first.
+    ///
+    /// A name seen on both tiers is visited once. That happens for as long as it takes a
+    /// tiering pass to delete the hot copy after recording the cold one — and, after a crash
+    /// in that window, indefinitely.
     fn for_each_segment(
         &self,
         chain: &str,
         mut visit: impl FnMut(&str, u64) -> Result<()>,
     ) -> Result<()> {
-        let dir = layout::segment_dir(&self.root, chain, self.kind)?;
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(StoreError::Io {
-                    operation: "listing segments",
-                    path: dir,
-                    source,
-                });
-            }
-        };
+        let mut seen: HashSet<String> = HashSet::new();
 
-        for entry in entries {
-            let entry = entry.map_err(StoreError::io("listing segments", &dir))?;
-            let name = entry.file_name();
-            let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            visit(&name.to_string_lossy(), len)?;
+        for root in [Some(&self.root), self.cold.as_ref()].into_iter().flatten() {
+            let dir = layout::segment_dir(root, chain, self.kind)?;
+            for_each_file(&dir, |name, entry| {
+                if !seen.insert(name.to_owned()) {
+                    return Ok(());
+                }
+                visit(name, entry.metadata().map(|m| m.len()).unwrap_or(0))
+            })?;
         }
         Ok(())
     }
 
     /// Run `f` against the reader for one segment, opening it if the cached slot holds a
-    /// different one. `Ok(None)` means the segment file does not exist.
+    /// different one. `Ok(None)` means the segment is on neither tier.
     fn with_reader<T>(
         &self,
         chain: &str,
@@ -285,14 +439,17 @@ impl Segments {
         let mut slot = self.reader.lock().expect("store reader lock poisoned");
 
         if !slot.as_ref().is_some_and(|r| r.matches(chain, index)) {
-            let (seg, idx) =
-                layout::segment_paths(&self.root, chain, self.kind, index, self.segment_size)?;
+            let Some((seg, idx, hot)) = self.locate(chain, index)? else {
+                *slot = None;
+                return Ok(None);
+            };
             match SegmentReader::open(&seg, &idx)? {
                 Some(reader) => {
-                    *slot = Some(Active {
+                    *slot = Some(CachedReader {
                         chain: chain.to_owned(),
                         index,
                         inner: reader,
+                        hot,
                     });
                 }
                 None => {
@@ -304,4 +461,53 @@ impl Segments {
 
         f(&mut slot.as_mut().expect("just opened").inner).map(Some)
     }
+
+    /// Where a segment's files are, and whether that is the hot tier.
+    ///
+    /// Hot wins when both hold it. They are identical while that is true — a cold copy is
+    /// only made from a verified read of the hot one — so the choice is about which tier is
+    /// cheaper to read, not about which is right.
+    fn locate(&self, chain: &str, index: u64) -> Result<Option<(PathBuf, PathBuf, bool)>> {
+        let (seg, idx) =
+            layout::segment_paths(&self.root, chain, self.kind, index, self.segment_size)?;
+        if seg.exists() {
+            return Ok(Some((seg, idx, true)));
+        }
+
+        let Some(cold) = &self.cold else {
+            return Ok(None);
+        };
+        let (seg, idx) = layout::segment_paths(cold, chain, self.kind, index, self.segment_size)?;
+        if seg.exists() {
+            Ok(Some((seg, idx, false)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Visit every file in one directory. A directory that does not exist yet is an empty store,
+/// not a failure — neither tier is provisioned before something is written to it.
+fn for_each_file(
+    dir: &Path,
+    mut visit: impl FnMut(&str, &std::fs::DirEntry) -> Result<()>,
+) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(StoreError::Io {
+                operation: "listing segments",
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(StoreError::io("listing segments", dir))?;
+        let name = entry.file_name();
+        visit(&name.to_string_lossy(), &entry)?;
+    }
+    Ok(())
 }

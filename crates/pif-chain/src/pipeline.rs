@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use pif_core::{ChainConfig, ChainInfo};
 use pif_db::repo;
-use pif_store::{HotStore, StorageCache};
+use pif_store::{HotStore, StorageCache, Tierable};
 use sqlx::PgPool;
 
 use crate::client::{ChainClient, EndpointPool};
@@ -22,6 +22,7 @@ use crate::decode::{self, AtBlock};
 use crate::error::{ChainError, Result};
 use crate::handlers::{BlockContext, HandlerRegistry, Selected};
 use crate::storage::SubxtStorage;
+use crate::tiering::{Tiering, TieringReport};
 use crate::{digest, fetch};
 
 /// How long to wait before reconnecting after the block stream drops.
@@ -131,12 +132,34 @@ pub async fn run(
         chunk_size: config.pipeline().chunk_size,
     };
 
-    tokio::try_join!(
-        fetch.run(start, options.stop_at),
-        digest.run(start, options.stop_at),
-    )?;
+    // Tiering is raced against the pair rather than joined with them: it has no end
+    // condition, so joining would mean `pif index --to N` never finishing. It only ever
+    // returns on an error it could not retry, and cancelling it when the pipeline stops
+    // loses nothing — a pass is idempotent and the next run picks up where it left off.
+    let tierable = archives.tierable();
+    let tiering = tiering(pool, config, &tierable);
+
+    tokio::select! {
+        result = async {
+            tokio::try_join!(
+                fetch.run(start, options.stop_at),
+                digest.run(start, options.stop_at),
+            )
+        } => { result?; }
+        result = tiering.run_forever() => { result?; }
+    }
 
     Ok(())
+}
+
+/// Move everything currently eligible to the cold tier, once — `pif archive`.
+///
+/// Needs no node: a segment moves on what the digest watermark says about it and how long the
+/// file has been sitting there, both of which are local.
+pub async fn archive_once(pool: &PgPool, config: &ChainConfig) -> Result<TieringReport> {
+    let archives = open_archives(config)?;
+    let tierable = archives.tierable();
+    tiering(pool, config, &tierable).pass().await
 }
 
 /// Fetch blocks into the archive and nothing else — `pif fetch`.
@@ -254,9 +277,17 @@ pub async fn replay(
 pub struct StoreStatus {
     pub chain_id: String,
     pub path: String,
+    /// Where digested segments are moved to, if anywhere.
+    pub cold_path: Option<String>,
     /// `None` for a chain that has never been indexed here.
     pub watermarks: Option<pif_db::Watermarks>,
     pub usage: pif_store::StoreUsage,
+    /// What has moved off the hot tier: blocks and archived reads together.
+    ///
+    /// Reported apart from `usage` and `reads` rather than summed into them, because the
+    /// question the two answer is different — one is how much of the expensive disk is in
+    /// use, the other is how much history is no longer on it.
+    pub cold: pif_store::Usage,
     /// What the archived handler storage reads occupy.
     ///
     /// Reported separately because it is sized by an entirely different thing: a state-heavy
@@ -292,11 +323,19 @@ pub async fn store_status(pool: &PgPool, config: &ChainConfig) -> Result<StoreSt
         None => None,
     };
 
+    let cold_blocks = blocks.cold_usage(&config.id)?;
+    let cold_reads = archives.reads.cold_usage(&config.id)?;
+
     Ok(StoreStatus {
         chain_id: config.id.clone(),
         path: blocks.root().display().to_string(),
+        cold_path: blocks.cold_root().map(|p| p.display().to_string()),
         watermarks: repo::load_watermarks(pool, &config.id).await?,
         usage: blocks.usage(&config.id)?,
+        cold: pif_store::Usage {
+            segments: cold_blocks.segments + cold_reads.segments,
+            bytes: cold_blocks.bytes + cold_reads.bytes,
+        },
         reads: archives.reads.usage(&config.id)?,
         replayable,
         runtimes_without_metadata: repo::runtimes_without_metadata(pool, &config.id).await?,
@@ -412,22 +451,54 @@ struct Archives {
     reads: StorageCache,
 }
 
+impl Archives {
+    /// Both halves, in the order the tiering task moves them.
+    fn tierable(&self) -> [&dyn pif_store::Tierable; 2] {
+        [&self.blocks, &self.reads]
+    }
+}
+
 /// Open both halves of this chain's archive.
 ///
 /// Two stores under one root, sharing a key — the block number — so a replay of a range
-/// reads both sequentially and, later, a cold tier can move both together.
+/// reads both sequentially and a cold tier moves both together.
 fn open_archives(config: &ChainConfig) -> Result<Archives> {
     let pipeline = config.pipeline();
-    let blocks = HotStore::open(&pipeline.hot_path, pipeline.segment_size)?;
-    let reads = StorageCache::open(&pipeline.hot_path, pipeline.segment_size)?;
+    let blocks = HotStore::open_tiered(
+        &pipeline.hot_path,
+        pipeline.cold_path.clone(),
+        pipeline.segment_size,
+    )?;
+    let reads = StorageCache::open_tiered(
+        &pipeline.hot_path,
+        pipeline.cold_path.clone(),
+        pipeline.segment_size,
+    )?;
 
     tracing::info!(
         chain = %config.id,
         path = %blocks.root().display(),
+        cold = ?blocks.cold_root(),
         segment_size = blocks.segment_size(),
         "block archive ready"
     );
     Ok(Archives { blocks, reads })
+}
+
+/// This chain's tiering policy, over an already-open archive.
+fn tiering<'a>(
+    pool: &'a PgPool,
+    config: &'a ChainConfig,
+    archives: &'a [&'a dyn pif_store::Tierable],
+) -> Tiering<'a> {
+    let pipeline = config.pipeline();
+    Tiering {
+        pool,
+        chain_id: &config.id,
+        archives,
+        on_digest: pipeline.on_digest,
+        retention: pipeline.retention,
+    }
 }
 
 /// How far the fetch stage may run ahead of the digest.

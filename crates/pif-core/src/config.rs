@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -33,9 +34,8 @@ pub struct IndexerConfig {
 /// fetch stage writes raw blocks here, and the digest stage reads them back instead of
 /// asking the network again.
 ///
-/// Only the settings the current pipeline honours are here. The rest of IPD-002's table —
-/// `cold_path`, `retention`, `on_digest` — arrives with the phases that act on them, rather
-/// than sitting in the config doing nothing.
+/// Only the settings the current pipeline honours are here — a knob that parses and does
+/// nothing is worse than an absent one, because it reads as configured behaviour.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
@@ -43,6 +43,30 @@ pub struct PipelineConfig {
     /// the directory is created on first run rather than being required up front.
     #[serde(default = "default_hot_path")]
     pub hot_path: PathBuf,
+
+    /// Second, cheaper root that digested segments are moved to.
+    ///
+    /// Omit to keep everything on [`PipelineConfig::hot_path`]. Set it and history moves
+    /// SSD → HDD once it has been digested and has sat out its [`PipelineConfig::retention`]
+    /// — and stays replayable from there, because reads fall through to it. Polkadot is
+    /// 60–120 GB of blocks with zstd, and a state-heavy handler's read cache can exceed the
+    /// blocks themselves, so this is the difference between the archive fitting and not.
+    #[serde(default)]
+    pub cold_path: Option<PathBuf>,
+
+    /// How long a digested segment stays on the hot tier before
+    /// [`PipelineConfig::on_digest`] applies to it.
+    ///
+    /// Written as `30d`, `12h`, `45m` or `10s`. The default keeps a day of history on the
+    /// fast disk, which is the window in which a re-digest is usually wanted: adding a
+    /// handler, or fixing a decode bug, over what was just indexed. Older history is not
+    /// less replayable for having moved — only slower to reach.
+    #[serde(default = "default_retention", with = "duration_string")]
+    pub retention: Duration,
+
+    /// What happens to a segment once it is digested and past its retention.
+    #[serde(default)]
+    pub on_digest: OnDigest,
 
     /// Blocks per segment file.
     ///
@@ -92,8 +116,86 @@ pub struct PipelineConfig {
     pub digest_batch: u64,
 }
 
+/// What to do with a segment the digest is finished with.
+///
+/// The default is [`OnDigest::Archive`], and `Delete` is deliberately not it: deleting a
+/// block the moment it is digested forfeits replay — the point of the whole archive — to save
+/// disk that `retention` already manages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnDigest {
+    /// Move it to `cold_path`. With no `cold_path` set there is nowhere to move it, so it
+    /// stays hot — which is why the default is safe on a config that says nothing at all.
+    #[default]
+    Archive,
+
+    /// Leave it on the hot tier forever. The archive grows without bound, deliberately.
+    Keep,
+
+    /// Delete it. **Forfeits replay for that range** — the blocks are gone, and only the
+    /// rows the digest derived from them remain. For deployments that genuinely only want
+    /// the derived tables.
+    Delete,
+}
+
 fn default_hot_path() -> PathBuf {
     PathBuf::from(".pif-store")
+}
+
+/// A day: long enough to cover the re-digest that follows a fresh index, short enough that
+/// the hot tier holds a bounded amount of history.
+fn default_retention() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+/// `30d` / `12h` / `45m` / `10s`, in TOML and back.
+///
+/// Written by hand rather than pulled in as a dependency: this is the only duration in the
+/// config, and the four suffixes people actually write for a retention window are the whole
+/// grammar. A bare number is rejected rather than guessed at — `retention = 30` reads as
+/// thirty days to whoever wrote it and thirty seconds to whoever parses it.
+mod duration_string {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    const UNITS: [(char, u64); 4] = [('s', 1), ('m', 60), ('h', 3600), ('d', 86_400)];
+
+    pub fn serialize<S: Serializer>(value: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        let seconds = value.as_secs();
+        // The largest unit it divides exactly into, so what was written comes back out.
+        let (suffix, scale) = UNITS
+            .iter()
+            .rev()
+            .find(|(_, scale)| seconds != 0 && seconds.is_multiple_of(*scale))
+            .copied()
+            .unwrap_or(('s', 1));
+        s.serialize_str(&format!("{}{suffix}", seconds / scale))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let raw = String::deserialize(d)?;
+        parse(&raw).map_err(serde::de::Error::custom)
+    }
+
+    pub(super) fn parse(raw: &str) -> Result<Duration, String> {
+        let raw = raw.trim();
+        let (value, suffix) = raw.split_at(raw.len().saturating_sub(1));
+
+        let scale = UNITS
+            .iter()
+            .find(|(unit, _)| suffix == unit.to_string())
+            .map(|(_, scale)| *scale)
+            .ok_or_else(|| {
+                format!("{raw:?} has no unit; write a duration like \"30d\", \"12h\", \"45m\" or \"10s\"")
+            })?;
+
+        let value: u64 = value.parse().map_err(|_| {
+            format!("{raw:?} is not a duration; write a whole number and a unit, like \"30d\"")
+        })?;
+
+        Ok(Duration::from_secs(value * scale))
+    }
 }
 
 fn default_segment_size() -> u64 {
@@ -114,6 +216,9 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             hot_path: default_hot_path(),
+            cold_path: None,
+            retention: default_retention(),
+            on_digest: OnDigest::default(),
             segment_size: default_segment_size(),
             chunk_size: default_chunk_size(),
             max_digest_lag: None,
@@ -493,6 +598,11 @@ impl IndexerConfig {
             if pipeline.hot_path.is_relative() {
                 pipeline.hot_path = base.join(&pipeline.hot_path);
             }
+            if let Some(cold) = &pipeline.cold_path
+                && cold.is_relative()
+            {
+                pipeline.cold_path = Some(base.join(cold));
+            }
             // Deliberately *not* checked for existence: the store is created on first run.
             // Requiring it up front would make a fresh checkout fail to start for a reason
             // the operator cannot act on.
@@ -623,6 +733,35 @@ impl IndexerConfig {
                         "chain {:?}: pipeline.hot_path must not be empty",
                         chain.id
                     )));
+                }
+                if let Some(cold) = &pipeline.cold_path {
+                    if cold.as_os_str().is_empty() {
+                        return Err(Error::ConfigInvalid(format!(
+                            "chain {:?}: pipeline.cold_path must not be empty; omit it to keep \
+                             everything on the hot tier",
+                            chain.id
+                        )));
+                    }
+                    // Not a harmless no-op: tiering would copy each segment over itself and
+                    // then delete the result.
+                    if *cold == pipeline.hot_path {
+                        return Err(Error::ConfigInvalid(format!(
+                            "chain {:?}: pipeline.cold_path and pipeline.hot_path are both {}; \
+                             a segment cannot be tiered onto itself",
+                            chain.id,
+                            cold.display()
+                        )));
+                    }
+                    // A cold path that nothing will ever write to reads as configured
+                    // behaviour, and the disk it was bought for stays empty.
+                    if pipeline.on_digest == OnDigest::Keep {
+                        return Err(Error::ConfigInvalid(format!(
+                            "chain {:?}: pipeline.cold_path is set but on_digest = \"keep\", so \
+                             nothing would ever move there; use \"archive\" to tier, or drop \
+                             cold_path to keep everything hot",
+                            chain.id
+                        )));
+                    }
                 }
                 if pipeline.chunk_size == 0 {
                     return Err(Error::ConfigInvalid(format!(
@@ -1279,6 +1418,135 @@ mod tests {
         // resolved even though the directory does not exist yet.
         assert_eq!(config.chains[0].pipeline().hot_path, dir.join("archive"));
         assert!(!dir.join("archive").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_retention_window_is_written_the_way_people_write_one() {
+        let config = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+            ws_url = "ws://127.0.0.1:9944"
+
+            [chains.pipeline]
+            cold_path = "/mnt/hdd/pif"
+            retention = "30d"
+            on_digest = "archive"
+            "#,
+        )
+        .unwrap();
+
+        let pipeline = config.chains[0].pipeline();
+        assert_eq!(pipeline.retention, Duration::from_secs(30 * 86_400));
+        assert_eq!(pipeline.cold_path, Some(PathBuf::from("/mnt/hdd/pif")));
+        assert_eq!(pipeline.on_digest, OnDigest::Archive);
+    }
+
+    #[test]
+    fn every_unit_round_trips_and_a_bare_number_does_not_parse() {
+        for (written, seconds) in [
+            ("10s", 10),
+            ("45m", 2_700),
+            ("12h", 43_200),
+            ("30d", 2_592_000),
+        ] {
+            let parsed = duration_string::parse(written).expect(written);
+            assert_eq!(parsed, Duration::from_secs(seconds));
+            // Serialised back in the same unit it was written in, so a config that is read
+            // and rewritten does not drift into seconds.
+            let rendered = toml::to_string(&PipelineConfig {
+                retention: parsed,
+                ..PipelineConfig::default()
+            })
+            .unwrap();
+            assert!(
+                rendered.contains(&format!("retention = \"{written}\"")),
+                "{written} did not survive a round trip: {rendered}"
+            );
+        }
+
+        // Ambiguous rather than wrong: "30" reads as days to whoever wrote it.
+        let err = duration_string::parse("30").unwrap_err();
+        assert!(err.contains("unit"), "got: {err}");
+        assert!(duration_string::parse("").is_err());
+        assert!(duration_string::parse("30y").is_err());
+    }
+
+    #[test]
+    fn the_default_is_a_hot_archive_that_never_deletes_anything() {
+        // `delete` forfeits replay — the point of the archive — so it has to be asked for.
+        let pipeline = PipelineConfig::default();
+        assert_eq!(pipeline.on_digest, OnDigest::Archive);
+        assert_eq!(pipeline.cold_path, None);
+        assert_eq!(pipeline.retention, Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn rejects_a_cold_path_that_is_the_hot_path() {
+        // Tiering would copy each segment over itself and then delete the result.
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+            ws_url = "ws://127.0.0.1:9944"
+
+            [chains.pipeline]
+            hot_path = "/mnt/ssd/pif"
+            cold_path = "/mnt/ssd/pif"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("cannot be tiered onto itself"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_cold_path_nothing_would_ever_move_to() {
+        // A disk bought for the archive that stays empty, with the config claiming otherwise.
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+            ws_url = "ws://127.0.0.1:9944"
+
+            [chains.pipeline]
+            cold_path = "/mnt/hdd/pif"
+            on_digest = "keep"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("on_digest"), "got: {err}");
+    }
+
+    #[test]
+    fn resolves_the_cold_path_against_the_config_file_too() {
+        let dir = std::env::temp_dir().join("pif-config-cold-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("chains.toml"),
+            r#"
+            [pipeline]
+            hot_path = "archive"
+            cold_path = "archive-cold"
+
+            [[chains]]
+            id = "local"
+            ws_url = "ws://127.0.0.1:9944"
+            "#,
+        )
+        .unwrap();
+
+        let config = IndexerConfig::from_path(dir.join("chains.toml")).unwrap();
+        assert_eq!(
+            config.chains[0].pipeline().cold_path,
+            Some(dir.join("archive-cold"))
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

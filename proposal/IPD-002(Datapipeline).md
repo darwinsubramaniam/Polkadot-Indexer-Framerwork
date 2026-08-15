@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Phases 0, 0.5, 1, 2, 3 and 4 shipped; 5 proposed |
+| **Status** | Every phase shipped — 0, 0.5, 1, 2, 3, 4 and 5 |
 | **Author** | Darwin Subramaniam |
 | **Created** | 2026-08-15 |
 | **Target** | Every chain reached over RPC (`ChainSource::Rpc`) |
@@ -776,6 +776,16 @@ records where it was supposed to be. What remains is bookkeeping the filesystem 
 cannot answer: which tier a segment is on, and its checksum. `cold_path` comes from config
 (§10.1), so the cold location is computed the same way.
 
+> [!NOTE]
+> **A row appears when a segment *leaves* the hot tier, not when it is written.** Settled
+> while shipping phase 5, and it follows from the paragraph above rather than adding to it:
+> while a segment is hot, its path is computed and its presence is a fact about the
+> filesystem, so a row would only be a second copy of something already knowable — and the
+> day the two disagreed, the table would be the one that was wrong. What the filesystem
+> cannot answer is the checksum the copy was verified against on its way to the cold tier,
+> which is exactly what the row is for. `on_digest = "delete"` writes no row and removes any
+> that exists, so `segments` never names a file nothing can read.
+
 > [!IMPORTANT]
 > **`fetch_watermark` is the highest *contiguous* block, never the highest present.** Parallel
 > chunk fetch means block 5000 can land before 4000. A digest loop that asks "does key N+1
@@ -803,7 +813,7 @@ number, because they were the same event. Once split:
 | `follow_head` gap detection (`pipeline.rs:192`) | `load_cursor` | **fetch** watermark |
 | `pipeline::run` catch-up start (`pipeline.rs:79`) | `load_cursor` | **fetch** watermark |
 | GraphQL indexing progress | `indexer_state` | **digest** watermark — anything else advertises blocks whose rows do not exist yet |
-| Tiering task | — | never below `digest_watermark − retention_margin` |
+| Tiering task | — | **digest** watermark, as a hard ceiling: a segment moves only once `segment.to_block <= digest_watermark`. The margin is a *duration* (`retention`) rather than a block count, because what it is protecting is a human deciding to re-digest what was just indexed — and that is measured in hours, not in blocks. It is judged from the segment file's own mtime, which is the one timestamp that cannot disagree with the file being moved. |
 
 ---
 
@@ -1295,8 +1305,18 @@ crates/pif-store/
                       exist (§9.2): the path is derived here, never recorded.
   src/hot.rs        — HotStore: the u64 → RawBlock map, plus metadata by spec_version
   src/cache.rs      — StorageCache: a byte-level KV over CacheKey. Not the decorator.
-  src/cold.rs       — tiering: copy → fsync → verify checksum → delete
+  src/cold.rs       — tiering: copy → fsync → verify checksum → delete, and `Tierable`
 ```
+
+As shipped, `segstore.rs` — the shared body of both stores — holds **two** roots rather than
+one: writes only ever go to the hot root, and reads try it first and fall through to the cold
+one. That asymmetry is the whole of tiering as far as the byte layer is concerned, and it is
+what keeps the move invisible above: nothing outside this crate asks which tier answered.
+
+`cold.rs` also carries `Tierable`, the four methods a tiering pass needs of an archive
+(`hot_segments`, `copy_to_cold`, `drop_hot`, `cold_root`). Both stores implement it, so the
+policy layer moves a block and the state read at it through one code path rather than two
+lookalikes — and the pass iterates `[&dyn Tierable]` instead of naming either type.
 
 `HotStore` is the §9.1 map, and one method on it is not obvious:
 
@@ -1368,7 +1388,7 @@ parses in tests and fails in the field.
 | `src/config.rs:36` | `ChainSource::Rpc` gains `endpoints: Vec<Endpoint>` alongside `url`. |
 | `src/config.rs:172-200` | `TryFrom<RawChainConfig>` resolves the source from *three* spellings instead of two: `ws_url`, `[chains.source]` with `url`, and `[chains.source]` with `endpoints`. The existing "set either, not both" error (`config.rs:177-183`) extends to the new pair. |
 | `src/config.rs:156` | `RawChainConfig` gains `pipeline: Option<PipelineConfig>`. |
-| `src/config.rs` | New `PipelineConfig` (`hot_path`, `cold_path`, `chunk_size`, `retention`, `on_digest`, `max_digest_lag`), optional per chain, with a global default on `IndexerConfig` — which has no `deny_unknown_fields`, so a new top-level table is backwards compatible. **Each phase ships only the fields it honours** — `hot_path` and `segment_size` in phase 1, `max_digest_lag` in phase 2, `chunk_size` in phase 3, `digest_batch` in phase 4 — rather than declaring the whole table up front: a knob that parses and does nothing is worse than an absent one, because it reads as configured behaviour. The rest arrive with the phases that act on them, and `IndexerConfig`'s missing `deny_unknown_fields` is exactly what makes adding them later a non-event. |
+| `src/config.rs` | New `PipelineConfig` (`hot_path`, `cold_path`, `chunk_size`, `retention`, `on_digest`, `max_digest_lag`), optional per chain, with a global default on `IndexerConfig` — which has no `deny_unknown_fields`, so a new top-level table is backwards compatible. **Each phase ships only the fields it honours** — `hot_path` and `segment_size` in phase 1, `max_digest_lag` in phase 2, `chunk_size` in phase 3, `digest_batch` in phase 4, `cold_path` / `retention` / `on_digest` in phase 5 — rather than declaring the whole table up front: a knob that parses and does nothing is worse than an absent one, because it reads as configured behaviour. `IndexerConfig`'s missing `deny_unknown_fields` is exactly what made adding them later a non-event. **Done.** `retention` is a duration written the way people write one (`30d`, `12h`, `45m`, `10s`) with a hand-rolled parser rather than a dependency, and a bare number is rejected rather than guessed at — `retention = 30` reads as thirty days to whoever wrote it and thirty seconds to whoever parses it. |
 | `src/config.rs:226` | `resolve_paths` resolves `hot_path`/`cold_path` relative to the config file, as it already does for chain specs — but checks `is_dir()` and **must not require pre-existence**, since the store is created on first run. |
 | `src/config.rs:261` | `validate()` gains: reject an empty `endpoints` list; apply the existing `ws://`/`wss://` check (`config.rs:286-293`) to *every* endpoint; reject `cold_path == hot_path`; reject an explicit `max_digest_lag > 256` when no endpoint declares `archive`. |
 
@@ -1413,7 +1433,7 @@ API is used throughout (`repo.rs:3-7` — no `query!` macros, deliberately), so 
 | File | Change |
 |---|---|
 | `src/main.rs:30` | New subcommands: `pif fetch` (fetch only), `pif digest` (digest only), `pif replay --from --to`, `pif archive` (run tiering now), `pif store status`. `pif index` keeps running both, so nothing about today's usage changes. |
-| `src/main.rs:116` | The per-chain `JoinSet` gains a second task per chain — fetch and digest — plus one shared tiering task. |
+| `src/main.rs:116` | ~~The per-chain `JoinSet` gains a second task per chain — fetch and digest — plus one shared tiering task.~~ **Done, and per chain rather than shared.** Everything tiering reads is already scoped by `chain_id`, and `run()` is already per chain, so a shared task would need a coordinator to buy nothing. It is a third arm inside the chain's own future — `select!`ed against the fetch/digest pair rather than joined with it, because tiering has no end condition and joining would mean `pif index --to N` never finishing. Cancelling it loses nothing: a pass is idempotent and the next one resumes from the filesystem. |
 
 ### 11.6 Wiring
 
@@ -1443,7 +1463,7 @@ a coherent system.
 | **2 — Storage read cache** *(done)* | `pif_store::StorageCache`, `pif_chain::CachedStorage`, the max-lag brake with an archive-capability probe, `StorageNotArchived`, `ChainNotIndexed` | **Replay is fully offline, handlers included** — `pif replay` no longer opens a connection at all, and a miss is a named error rather than a silent fetch. This is the phase that makes phase 1 mean what it claims. |
 | **3 — Multi-endpoint** *(done)* | `EndpointPool`, `limiter.rs` (token bucket + AIMD + breaker), the chunk lease queue on `fetch_chunks`, per-endpoint genesis + capability probe, `AllEndpointsDown` / `EndpointGenesisMismatch` / `ChunksFailed`. Linkage verification and the capability probe had already landed in phases 1 and 2. | Backfill parallelises across endpoints and survives a 429 or a dead provider. Verified: two endpoints interleave chunks and produce the same chain as one; a dead member is skipped; all of them dead is a named failure. |
 | **4 — Batched digest** *(done)* | `write_blocks_in_tx` with `UNNEST` inserts, `pipeline.digest_batch` blocks per transaction, the never-wait-to-fill rule | The digest stops being the bottleneck phase 3 just created. Measured on a local dev chain, 701 blocks replayed from the archive with no network in play: **2.0 s at `digest_batch = 1`, 0.42 s at 32** — 2.9 ms per block down to 0.6 ms. These are near-empty blocks, so almost all of that is the per-block transaction round-trips; the `UNNEST` half pays off in proportion to how many rows a block actually has. |
-| **5 — Cold tiering** | `cold.rs`, `segments.tier`, `archive_watermark`, retention policy | History moves SSD → HDD and remains replayable. |
+| **5 — Cold tiering** *(done)* | `pif_store::cold` (copy → fsync → verify → delete, and the `Tierable` surface both archives share), a second root on `Segments` with read fall-through, `pif_chain::Tiering`, `cold_path` / `retention` / `on_digest`, `segments.tier`, `archive_watermark`, `pif archive` | History moves SSD → HDD and remains replayable — verified by replaying a range across the tier boundary against a dead address. `on_digest = "delete"` frees the disk and gives up that replay, loudly. |
 
 > [!NOTE]
 > Phase 4 after phase 3 is deliberate and slightly uncomfortable: phase 3 will make the digest
@@ -1466,6 +1486,37 @@ a coherent system.
 > `a_tight_brake_does_not_deadlock_the_two_stages` now runs `digest_batch = 30` against
 > `max_digest_lag = 3`, and `a_batched_digest_writes_the_same_rows` runs a batch ten times
 > wider than the whole range. Both fail by timing out.
+
+> [!IMPORTANT]
+> **Tiering moves a *prefix*, never a set.** Found while shipping phase 5. §9.2 gives
+> `archive_watermark` as "highest block moved to cold storage", and a pass that considered
+> each hot segment independently — moving the eligible ones and skipping the rest — would
+> make that number a lie the first time a segment in the middle was skipped for being one
+> block short of the digest watermark. Everything below the watermark is supposed to have
+> left the hot tier; a set-shaped pass only guarantees that *something* has.
+>
+> So segments are visited in block order and the pass **stops** at the first ineligible one,
+> exactly as `contiguous_done_end` does for `fetch_watermark`. The two rules that decide
+> eligibility are the digest bound (`segment.to_block <= digest_watermark`) and retention;
+> both are monotonic in block order, so stopping loses nothing a later pass will not pick up.
+>
+> The same reasoning settles which archive sets the watermark: **only the blocks**. The
+> storage read cache is keyed by block number too, but it is *sparse* — a block whose
+> handlers read no state has no record at all, and a chain with no state-reading handler has
+> none whatsoever — so its segment numbering answers a different question and would move the
+> watermark for reasons that have nothing to do with blocks.
+
+> [!WARNING]
+> **A deleted segment keeps answering through an open descriptor.** On Unix, unlinking a file
+> a reader still holds open leaves that reader working perfectly — on the invisible inode.
+> The digest holds exactly such a reader, cached so that walking a range is not one `open(2)`
+> per block, so tiering a segment out from under it would leave the pipeline reading a file
+> that no longer exists on either tier. The bytes would be *right*, which is what makes it
+> hard to notice: nothing fails, and the hot tier looks freed while the process still holds
+> it. `drop_hot` therefore invalidates the cached reader before unlinking, and the write side
+> takes the same care in reverse — a reader open on a segment's *cold* copy is dropped rather
+> than refreshed when a re-fetch writes that segment hot, because there is no appending your
+> way from one file to another.
 
 ---
 
@@ -1625,8 +1676,27 @@ Three things about the upgrade-boundary network are load-bearing and easy to get
   with a purpose-built state-reading handler. Faster and needs no parachain, so it is the one
   that runs routinely; the identity test above is what proves it on the handler people
   actually deploy.
-* tiering: archive 0..100, confirm `segments.tier = 'cold'`, files exist under `cold_path`, are
-  gone from `hot_path`, and a replay of 0..100 still succeeds
+* `pipeline_split.rs::tiered_history_is_gone_from_the_hot_tier_and_still_replayable` —
+  **written and passing.** The phase-5 claim: index a range, run one tiering pass, and require
+  that the moved segments are gone from `hot_path`, present under `cold_path`, recorded with
+  `segments.tier = 'cold'` and a four-byte CRC32, and that `archive_watermark` lands on the
+  highest block that left — never above `digest_watermark`. Then it replays the same range
+  **against a dead address** and compares every row to the first pass. Asserting it that way
+  rather than by counting reads is the point: a replay that fell back to the network could not
+  pass, and a tiering pass that had quietly become a delete could not either.
+
+  Two companions cover the edges the main test cannot: `an_undigested_segment_stays_hot`
+  fetches without digesting and requires that nothing moves — the bound that keeps tiering
+  from pulling the floor out from under the stage standing on it — and
+  `deleting_on_digest_gives_up_the_replay_it_frees_the_disk_for` requires `on_digest =
+  "delete"` to leave nothing on the cold tier, no row in `segments`, and a replay that stops
+  by name. All three run with `retention = 0`, which is not what a deployment would set; the
+  alternative is a test that waits a day.
+
+  Hermetically, `pif-store` covers the same shape with no database in play: a tiered segment
+  still reads back byte-identical, a tiered range is still a contiguous run rather than a
+  hole, a hot re-fetch over a tiered segment wins, the hot copy survives a crash before the
+  delete, and `meta/` stays put when the blocks move.
 
 **Manual smoke**
 

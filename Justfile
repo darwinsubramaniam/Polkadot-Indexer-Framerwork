@@ -96,6 +96,13 @@ digest *ARGS:
 replay FROM TO:
     cargo run -p polkadot-indexer-cli {{ALL}} -- replay --from {{FROM}} --to {{TO}}
 
+# Move digested history from the hot tier to the cold one, now.
+#
+# The same pass `just index` carries in the background, run once. Needs `cold_path` set in
+# config/chains.toml; without it there is nowhere to move anything and this is a no-op.
+archive *ARGS:
+    cargo run -p polkadot-indexer-cli {{ALL}} -- archive {{ARGS}}
+
 # What the archive holds, and how far each stage has got.
 store-status *ARGS:
     cargo run -p polkadot-indexer-cli {{ALL}} -- store status {{ARGS}}

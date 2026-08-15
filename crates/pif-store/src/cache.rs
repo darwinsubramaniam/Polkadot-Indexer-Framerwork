@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use parity_scale_codec::{Decode, Encode};
 
+use crate::cold::{SegmentSpan, Tierable, Tiered};
 use crate::error::{Result, StoreError};
 use crate::layout::{self, DEFAULT_SEGMENT_SIZE};
 use crate::segstore::{Segments, Usage};
@@ -110,8 +111,22 @@ pub struct StorageCache {
 
 impl StorageCache {
     pub fn open(path: impl Into<PathBuf>, segment_size: u64) -> Result<Self> {
+        Self::open_tiered(path, None, segment_size)
+    }
+
+    /// Open a cache whose digested segments may be moved to a second, cheaper root.
+    ///
+    /// The state a handler read moves with the blocks it was read for. Tiering only the
+    /// blocks would leave a replay of old history reading its state from the SSD it was
+    /// meant to free — or, on a state-heavy handler, leave the larger half of the archive
+    /// behind entirely.
+    pub fn open_tiered(
+        hot: impl Into<PathBuf>,
+        cold: Option<PathBuf>,
+        segment_size: u64,
+    ) -> Result<Self> {
         Ok(Self {
-            segments: Segments::new(path.into(), layout::STORAGE, segment_size)?,
+            segments: Segments::new(hot.into(), cold, layout::STORAGE, segment_size)?,
         })
     }
 
@@ -158,8 +173,36 @@ impl StorageCache {
         self.segments.sync()
     }
 
+    /// What this chain's archived reads occupy on the hot tier.
     pub fn usage(&self, chain: &str) -> Result<Usage> {
         self.segments.usage(chain)
+    }
+
+    /// What they occupy on the cold tier. Zero when there is no cold tier.
+    pub fn cold_usage(&self, chain: &str) -> Result<Usage> {
+        self.segments.cold_usage(chain)
+    }
+}
+
+impl Tierable for StorageCache {
+    fn kind(&self) -> &'static str {
+        layout::STORAGE
+    }
+
+    fn cold_root(&self) -> Option<&Path> {
+        self.segments.cold_root()
+    }
+
+    fn hot_segments(&self, chain: &str) -> Result<Vec<SegmentSpan>> {
+        self.segments.hot_segments(chain)
+    }
+
+    fn copy_to_cold(&self, chain: &str, index: u64) -> Result<Tiered> {
+        self.segments.copy_to_cold(chain, index)
+    }
+
+    fn drop_hot(&self, chain: &str, index: u64) -> Result<u64> {
+        self.segments.drop_hot(chain, index)
     }
 }
 

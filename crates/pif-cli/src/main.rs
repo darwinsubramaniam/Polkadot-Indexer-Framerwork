@@ -109,6 +109,20 @@ enum Command {
         to: u64,
     },
 
+    /// Move digested history from the hot tier to the cold one, now.
+    ///
+    /// Runs the same pass `pif index` carries in the background, once. Needs no node: what
+    /// moves is decided by the digest watermark and how long a segment has been sitting on
+    /// the fast disk, both of which are local.
+    Archive {
+        #[arg(long, env = "INDEXER_CONFIG", default_value = "config/chains.toml")]
+        config: PathBuf,
+
+        /// Tier only this chain id, instead of every configured chain.
+        #[arg(long)]
+        chain: Option<String>,
+    },
+
     /// Inspect the local block archive.
     Store {
         #[command(subcommand)]
@@ -256,6 +270,27 @@ async fn main() -> Result<()> {
             tracing::info!(from, to, "replay complete");
         }
 
+        Command::Archive { config, chain } => {
+            let config = IndexerConfig::from_path(&config)?;
+            for chain_config in select_chains(&config, chain.as_deref())? {
+                let report = pif_chain::archive_once(&pool, &chain_config).await?;
+                if report.moved_nothing() {
+                    println!(
+                        "{}: nothing eligible — a segment moves once the digest has passed it \
+                         and it has been hot for `retention`",
+                        chain_config.id
+                    );
+                } else {
+                    println!(
+                        "{}: {} segment(s) moved, {} freed on the hot tier",
+                        chain_config.id,
+                        report.segments,
+                        human_bytes(report.freed)
+                    );
+                }
+            }
+        }
+
         Command::Store {
             command: StoreCommand::Status { config, chain },
         } => {
@@ -348,6 +383,10 @@ where
 fn print_store_status(status: &pif_chain::pipeline::StoreStatus) {
     println!("chain            {}", status.chain_id);
     println!("archive          {}", status.path);
+    match &status.cold_path {
+        Some(path) => println!("cold tier        {path}"),
+        None => println!("cold tier        none — everything stays on the hot path"),
+    }
 
     match status.watermarks {
         Some(marks) => {
@@ -359,10 +398,14 @@ fn print_store_status(status: &pif_chain::pipeline::StoreStatus) {
         None => println!("watermarks       none — this chain has not been indexed here"),
     }
 
-    println!("segments         {}", status.usage.segments);
+    println!(
+        "segments         {} hot, {} cold",
+        status.usage.segments, status.cold.segments
+    );
     println!("runtimes         {}", status.usage.runtimes);
     println!("block bytes      {}", human_bytes(status.usage.bytes));
     println!("state bytes      {}", human_bytes(status.reads.bytes));
+    println!("cold bytes       {}", human_bytes(status.cold.bytes));
 
     let (pending, leased, failed) = status.chunks;
     if pending + leased + failed > 0 {

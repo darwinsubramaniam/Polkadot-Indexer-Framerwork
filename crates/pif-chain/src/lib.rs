@@ -18,10 +18,14 @@ pub mod limiter;
 pub mod metadata;
 pub mod pipeline;
 pub mod storage;
+pub mod tiering;
 
 pub use cache::CachedStorage;
 pub use client::ChainClient;
 pub use error::{ChainError, Result};
 pub use handlers::{BlockContext, EventHandler, HandlerRegistry};
-pub use pipeline::{IndexOptions, digest_only, fetch_only, replay, run, store_status};
+pub use pipeline::{
+    IndexOptions, archive_once, digest_only, fetch_only, replay, run, store_status,
+};
 pub use storage::{StorageAt, SubxtStorage};
+pub use tiering::{Tiering, TieringReport};

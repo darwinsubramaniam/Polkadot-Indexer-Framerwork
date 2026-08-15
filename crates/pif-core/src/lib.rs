@@ -10,5 +10,5 @@ pub mod error;
 pub mod ss58;
 
 pub use codec::{composite_to_json, value_to_json};
-pub use config::{ChainConfig, ChainSource, Endpoint, IndexerConfig, PipelineConfig};
+pub use config::{ChainConfig, ChainSource, Endpoint, IndexerConfig, OnDigest, PipelineConfig};
 pub use error::{ChainInfo, Error, Result};

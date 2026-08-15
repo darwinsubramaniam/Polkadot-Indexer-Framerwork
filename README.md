@@ -64,6 +64,7 @@ The payoff is not primarily speed. It is that **a re-index stops costing a re-do
 just fetch                  # archive blocks; decodes nothing
 just digest                 # process what is archived; no node needed without handlers
 just replay 0 1000          # re-process a range from local bytes
+just archive                # move digested history to the cold tier now
 just store-status           # what is held, and how far each stage has got
 ```
 
@@ -93,6 +94,15 @@ Anything the archive cannot answer stops it by name: `BlockNotArchived`,
 > permitted rate; repeated failure opens its circuit breaker; its leased chunks go back on
 > the queue and someone else takes them. Losing *all* of them is the one case that stops, and
 > even then the archive is unaffected — `pif digest` and `pif replay` still work against it.
+
+> **History moves to cheaper disk and stays replayable.** Set `cold_path` and a digested
+> segment is moved there once it has been on the SSD for `retention` — reads fall through, so
+> a replay over tiered history works exactly as it did before the move. The move is
+> copy → fsync → verify checksum → record → delete, never delete-then-record: a crash leaves
+> two copies, which costs disk, rather than none. `on_digest = "delete"` exists and forfeits
+> replay for that range, which is why it is not the default. Runtime metadata is never
+> tiered — losing a spec version's metadata makes every block that ran under it permanently
+> undecodable even though the bytes are intact.
 
 > **Light-client chains are not split.** A split digest resolves each block by *number*, and
 > that is the one question smoldot refuses to answer. Those chains keep the
@@ -555,6 +565,6 @@ driven through the CLI rather than the SDK, and a known multi-node peering limit
 
 ## Not yet implemented
 
-Batched multi-row inserts, cold tiering of digested segments to a second disk, reorg handling
-for non-finalized tailing, Prometheus metrics, custom `Config` types for Ethereum-style chains
+Reorg handling for non-finalized tailing, Prometheus metrics, object storage (S3/R2) as a
+cold tier rather than a local path, custom `Config` types for Ethereum-style chains
 (Moonbeam), XCM correlation across relay/parachain, and table partitioning by `chain_id`.

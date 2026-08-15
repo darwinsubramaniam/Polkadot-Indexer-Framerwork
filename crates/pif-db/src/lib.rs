@@ -4,7 +4,7 @@ pub mod models;
 pub mod repo;
 
 pub use models::{
-    ArchivedRuntime, BlockData, Cursor, NewBlock, NewEvent, NewExtrinsic, Watermarks,
+    ArchivedRuntime, BlockData, Cursor, NewBlock, NewEvent, NewExtrinsic, SegmentRecord, Watermarks,
 };
 pub use repo::DbResult;
 

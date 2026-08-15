@@ -24,11 +24,17 @@
 //!   with no display name, so archiving blocks alone would move the RPC load onto historical
 //!   state reads rather than removing it.
 //!
+//! Both can be opened over **two** roots: a hot one they are written to, and a cold one that
+//! digested segments are moved to once they have been on the SSD long enough ([`cold`]).
+//! Reads fall through, so history that has moved to an HDD is still replayable — at a tenth
+//! of the price per byte, and with no caller aware of which tier answered.
+//!
 //! This crate owns bytes on disk and nothing else: no Postgres, no subxt, no knowledge of
 //! the traits or error types above it. That is a compile requirement rather than a
 //! preference — see IPD-002 §11.1.1.
 
 pub mod cache;
+pub mod cold;
 pub mod error;
 pub mod hot;
 pub mod layout;
@@ -37,6 +43,7 @@ pub mod segment;
 mod segstore;
 
 pub use cache::{BlockReads, ReadKey, StorageCache};
+pub use cold::{SegmentSpan, Tierable, Tiered};
 pub use error::{Result, StoreError};
 pub use hot::{HotStore, StoreUsage};
 pub use layout::DEFAULT_SEGMENT_SIZE;

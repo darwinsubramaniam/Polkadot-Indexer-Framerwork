@@ -83,6 +83,18 @@ pub fn segment_stem(index: u64, segment_size: u64) -> String {
     )
 }
 
+/// The first block a segment file name covers, or `None` for a name that is not one.
+///
+/// The inverse of [`segment_stem`], and the reason the range is in the file name at all: a
+/// directory listing is enough to know what a tier holds, with nothing to consult and
+/// nothing to keep in step.
+pub fn stem_start(file_name: &str) -> Option<u64> {
+    let stem = file_name
+        .strip_suffix(".seg")
+        .or_else(|| file_name.strip_suffix(".idx"))?;
+    stem.split_once('-')?.0.parse().ok()
+}
+
 fn chain_dir(root: &Path, chain: &str) -> Result<PathBuf> {
     check_chain_id(chain)?;
     Ok(root.join(chain))
@@ -130,6 +142,15 @@ mod tests {
             assert!(number >= segment_start(index, 500));
             assert!(number <= segment_end(index, 500));
         }
+    }
+
+    #[test]
+    fn a_file_name_names_the_range_it_covers() {
+        // What the tiering task reads a directory with: no table, nothing to keep in step.
+        assert_eq!(stem_start("000012000-000012999.seg"), Some(12_000));
+        assert_eq!(stem_start("000012000-000012999.idx"), Some(12_000));
+        assert_eq!(stem_start("000012000-000012999.seg.partial"), None);
+        assert_eq!(stem_start("notes.txt"), None);
     }
 
     #[test]

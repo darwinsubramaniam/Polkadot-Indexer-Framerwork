@@ -40,6 +40,21 @@ pub enum StoreError {
 
     #[error("segment_size must be greater than zero")]
     InvalidSegmentSize,
+
+    /// One root for both tiers, which is a store that tiers onto itself.
+    ///
+    /// Caught here as well as in config validation because a store can be opened from code
+    /// with no config file in play, and the failure it would otherwise produce — a copy over
+    /// the file being copied — is destructive rather than merely confusing.
+    #[error(
+        "the cold path and the hot path are both {}; a segment cannot be tiered onto itself",
+        .0.display()
+    )]
+    ColdPathIsHotPath(PathBuf),
+
+    /// Asked to tier a segment by a store that has nowhere to put it.
+    #[error("no cold path is configured for this store, so there is nowhere to tier a segment to")]
+    NoColdTier,
 }
 
 impl StoreError {

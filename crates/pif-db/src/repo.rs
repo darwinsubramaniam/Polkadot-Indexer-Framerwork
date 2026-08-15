@@ -9,7 +9,7 @@
 use pif_core::ChainInfo;
 use sqlx::{PgConnection, PgPool};
 
-use crate::models::{ArchivedRuntime, BlockData, Cursor, Watermarks};
+use crate::models::{ArchivedRuntime, BlockData, Cursor, SegmentRecord, Watermarks};
 
 pub type DbResult<T> = Result<T, sqlx::Error>;
 
@@ -542,6 +542,114 @@ pub async fn advance_digest_watermark(
     .await?;
 
     Ok(())
+}
+
+/// Record that every block up to `to` has left the hot tier.
+///
+/// Monotonic like the other two, and bounded by them: a segment only becomes eligible to move
+/// once the digest is finished with it, so this can never overtake `digest_watermark` and the
+/// table's ordering check never has to catch it.
+pub async fn advance_archive_watermark(pool: &PgPool, chain_id: &str, to: i64) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE pipeline_watermarks
+        SET archive_watermark = GREATEST(archive_watermark, $2), updated_at = now()
+        WHERE chain_id = $1
+        "#,
+    )
+    .bind(chain_id)
+    .bind(to)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Record a segment on the cold tier.
+///
+/// Written **after** the copy has been verified and **before** the hot original is deleted.
+/// That order is the whole crash story: a failure anywhere in the sequence leaves two copies
+/// of the segment, which costs disk and is recoverable by re-running the pass, rather than
+/// none, which is not recoverable without going back to the network.
+pub async fn record_segment(
+    pool: &PgPool,
+    chain_id: &str,
+    segment: &SegmentRecord,
+) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO segments (chain_id, from_block, to_block, tier, bytes, checksum)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (chain_id, from_block) DO UPDATE SET
+            to_block  = EXCLUDED.to_block,
+            tier      = EXCLUDED.tier,
+            bytes     = EXCLUDED.bytes,
+            checksum  = EXCLUDED.checksum,
+            sealed_at = now()
+        "#,
+    )
+    .bind(chain_id)
+    .bind(segment.from_block)
+    .bind(segment.to_block)
+    .bind(&segment.tier)
+    .bind(segment.bytes)
+    .bind(&segment.checksum)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Forget a segment that is no longer anywhere.
+///
+/// `on_digest = "delete"` is the only thing that produces one. The row goes rather than
+/// gaining a third tier value, so `segments` never names a file that cannot be read.
+pub async fn forget_segment(pool: &PgPool, chain_id: &str, from_block: i64) -> DbResult<()> {
+    sqlx::query("DELETE FROM segments WHERE chain_id = $1 AND from_block = $2")
+        .bind(chain_id)
+        .bind(from_block)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+/// Every segment recorded for a chain, ascending.
+pub async fn segments(pool: &PgPool, chain_id: &str) -> DbResult<Vec<SegmentRecord>> {
+    let rows: Vec<(i64, i64, String, i64, Vec<u8>)> = sqlx::query_as(
+        r#"
+        SELECT from_block, to_block, tier, bytes, checksum
+        FROM segments WHERE chain_id = $1 ORDER BY from_block
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(from_block, to_block, tier, bytes, checksum)| SegmentRecord {
+                from_block,
+                to_block,
+                tier,
+                bytes,
+                checksum,
+            },
+        )
+        .collect())
+}
+
+/// How many segments are recorded on the cold tier, and what they occupy.
+pub async fn cold_segment_totals(pool: &PgPool, chain_id: &str) -> DbResult<(i64, i64)> {
+    let row: (i64, Option<i64>) = sqlx::query_as(
+        "SELECT count(*), sum(bytes) FROM segments WHERE chain_id = $1 AND tier = 'cold'",
+    )
+    .bind(chain_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok((row.0, row.1.unwrap_or(0)))
 }
 
 /// A range of blocks leased to one fetch worker.

@@ -81,8 +81,29 @@ pub struct Watermarks {
     pub fetch: i64,
     /// Highest block committed to Postgres. This is what indexing progress means.
     pub digest: i64,
-    /// Highest block moved to cold storage.
+    /// Highest block that has left the hot tier — moved to cold storage, or deleted under
+    /// `on_digest = "delete"`. Never above [`Watermarks::digest`]: a segment the digest has
+    /// not finished with is not a segment anything may move.
     pub archive: i64,
+}
+
+/// One segment of the archive, once it is no longer on the hot tier.
+///
+/// A row appears when a segment *leaves* the hot tier, not when it is written. While a
+/// segment is hot its location is computed from the block number and its presence is a fact
+/// about the filesystem, so a row would only be a second copy of something already knowable —
+/// and the day the two disagreed, the table would be the one that was wrong. What survives
+/// here is what the filesystem genuinely cannot answer: which tier holds it, and the checksum
+/// it was verified against on the way there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentRecord {
+    pub from_block: i64,
+    pub to_block: i64,
+    /// `hot` or `cold`.
+    pub tier: String,
+    pub bytes: i64,
+    /// CRC32 of the `.seg` file, big-endian.
+    pub checksum: Vec<u8>,
 }
 
 /// What the archive holds for one runtime, beyond the fact that it existed.

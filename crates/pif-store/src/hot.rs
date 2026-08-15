@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 
 use parity_scale_codec::{Decode, Encode};
 
+use crate::cold::{SegmentSpan, Tierable, Tiered};
 use crate::error::{Result, StoreError};
 use crate::layout::{self, DEFAULT_SEGMENT_SIZE};
 use crate::raw::RawBlock;
-use crate::segstore::Segments;
+use crate::segstore::{Segments, Usage};
 
 /// A block archive on local disk.
 ///
@@ -31,13 +32,26 @@ pub struct StoreUsage {
 }
 
 impl HotStore {
-    /// Open (or create) a store rooted at `path`.
+    /// Open (or create) a store rooted at `path`, with everything kept hot.
     ///
     /// The root is created on demand: config validation deliberately does not require it to
     /// pre-exist, because the store appears on first run rather than being provisioned.
     pub fn open(path: impl Into<PathBuf>, segment_size: u64) -> Result<Self> {
+        Self::open_tiered(path, None, segment_size)
+    }
+
+    /// Open a store whose digested segments may be moved to a second, cheaper root.
+    ///
+    /// Writes only ever go to `hot`. Reads try it first and fall through to `cold`, so a
+    /// tiered segment is still readable — and a replay over history that has moved to an HDD
+    /// works exactly as it did before it moved.
+    pub fn open_tiered(
+        hot: impl Into<PathBuf>,
+        cold: Option<PathBuf>,
+        segment_size: u64,
+    ) -> Result<Self> {
         Ok(Self {
-            segments: Segments::new(path.into(), layout::BLOCKS, segment_size)?,
+            segments: Segments::new(hot.into(), cold, layout::BLOCKS, segment_size)?,
         })
     }
 
@@ -114,6 +128,11 @@ impl HotStore {
 
     /// Archive a runtime's metadata under its spec version.
     ///
+    /// Always on the hot tier, and never moved off it. Metadata is a handful of megabytes for
+    /// a chain's entire history, and losing one version makes every block that ran under it
+    /// permanently undecodable even though the block bytes are intact — so it is the one part
+    /// of the archive no retention policy may touch.
+    ///
     /// Written to a temporary file and renamed, so a reader never sees a half-written
     /// runtime. Losing one of these makes every block that ran under that version
     /// permanently undecodable even though the block bytes are intact — which is why it is
@@ -175,7 +194,7 @@ impl HotStore {
         Ok(versions)
     }
 
-    /// Bytes and segment counts for one chain.
+    /// Bytes and segment counts for one chain, on the hot tier.
     pub fn usage(&self, chain: &str) -> Result<StoreUsage> {
         let usage = self.segments.usage(chain)?;
         Ok(StoreUsage {
@@ -183,6 +202,37 @@ impl HotStore {
             bytes: usage.bytes,
             runtimes: self.archived_runtimes(chain)?.len() as u64,
         })
+    }
+
+    /// What this chain's blocks occupy on the cold tier. Zero when there is no cold tier.
+    ///
+    /// Reported apart from [`HotStore::usage`] rather than summed into it because the two
+    /// answer different questions: one is how much of the expensive disk is in use, the other
+    /// is how much history has been moved off it.
+    pub fn cold_usage(&self, chain: &str) -> Result<Usage> {
+        self.segments.cold_usage(chain)
+    }
+}
+
+impl Tierable for HotStore {
+    fn kind(&self) -> &'static str {
+        layout::BLOCKS
+    }
+
+    fn cold_root(&self) -> Option<&Path> {
+        self.segments.cold_root()
+    }
+
+    fn hot_segments(&self, chain: &str) -> Result<Vec<SegmentSpan>> {
+        self.segments.hot_segments(chain)
+    }
+
+    fn copy_to_cold(&self, chain: &str, index: u64) -> Result<Tiered> {
+        self.segments.copy_to_cold(chain, index)
+    }
+
+    fn drop_hot(&self, chain: &str, index: u64) -> Result<u64> {
+        self.segments.drop_hot(chain, index)
     }
 }
 
@@ -206,6 +256,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = HotStore::open(dir.path(), 10).expect("open");
         (dir, store)
+    }
+
+    /// A store with both tiers under one temporary directory.
+    fn tiered() -> (tempfile::TempDir, HotStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            HotStore::open_tiered(dir.path().join("hot"), Some(dir.path().join("cold")), 10)
+                .expect("open");
+        (dir, store)
+    }
+
+    /// Move segment `index` the way the tiering task does: copy, verify, then delete.
+    fn tier(store: &HotStore, chain: &str, index: u64) -> Tiered {
+        let tiered = store.copy_to_cold(chain, index).expect("copy");
+        store.drop_hot(chain, index).expect("drop");
+        tiered
     }
 
     #[test]
@@ -375,5 +441,212 @@ mod tests {
     fn a_zero_segment_size_is_rejected_rather_than_dividing_by_zero() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(HotStore::open(dir.path(), 0).is_err());
+    }
+
+    #[test]
+    fn a_tiered_segment_is_still_readable() {
+        // The claim the cold tier makes: history moves to cheaper disk and stays replayable.
+        // If this fails, tiering is deletion with extra steps.
+        let (dir, store) = tiered();
+        for n in 0..25u64 {
+            store.put_block("polkadot", &sample(n)).expect("put");
+        }
+        store.sync().expect("sync");
+
+        let tiered = tier(&store, "polkadot", 0);
+        assert_eq!((tiered.span.from_block, tiered.span.to_block), (0, 9));
+        assert!(tiered.bytes > 0);
+
+        assert!(
+            !dir.path()
+                .join("hot/polkadot/blocks")
+                .join("000000000-000000009.seg")
+                .exists(),
+            "the hot copy must be gone, or nothing was freed"
+        );
+        assert!(
+            dir.path()
+                .join("cold/polkadot/blocks")
+                .join("000000000-000000009.seg")
+                .exists()
+        );
+
+        for n in 0..25u64 {
+            assert_eq!(
+                store.get_block("polkadot", n).expect("get"),
+                Some(sample(n)),
+                "block {n} must read the same whichever tier holds it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tiered_range_is_still_a_contiguous_run() {
+        // `pif store status` reports what can be replayed by walking the archive. A segment
+        // that has moved must not read as a hole, or the report would understate the archive
+        // by exactly the history that was tiered for being old enough to trust.
+        let (_dir, store) = tiered();
+        for n in 0..25u64 {
+            store.put_block("polkadot", &sample(n)).expect("put");
+        }
+        store.sync().expect("sync");
+
+        tier(&store, "polkadot", 0);
+        tier(&store, "polkadot", 1);
+
+        assert_eq!(store.first_block("polkadot").expect("scan"), Some(0));
+        assert_eq!(store.contiguous_end("polkadot", 0).expect("scan"), Some(24));
+    }
+
+    #[test]
+    fn tiering_moves_the_bytes_from_one_tier_to_the_other() {
+        let (_dir, store) = tiered();
+        for n in 0..15u64 {
+            store.put_block("polkadot", &sample(n)).expect("put");
+        }
+        store.sync().expect("sync");
+
+        let before = store.usage("polkadot").expect("usage");
+        assert_eq!(before.segments, 2);
+        assert_eq!(
+            store.cold_usage("polkadot").expect("usage"),
+            Usage::default()
+        );
+
+        tier(&store, "polkadot", 0);
+
+        let hot = store.usage("polkadot").expect("usage");
+        let cold = store.cold_usage("polkadot").expect("usage");
+        assert_eq!(hot.segments, 1, "one segment left on the expensive disk");
+        assert_eq!(cold.segments, 1);
+        assert!(hot.bytes < before.bytes);
+        assert!(cold.bytes > 0);
+    }
+
+    #[test]
+    fn re_fetching_over_a_tiered_segment_writes_hot_and_wins() {
+        // `pif fetch --from` over ground that has already moved. The write lands hot, and
+        // the read has to prefer it — otherwise a re-fetch would silently do nothing.
+        let (_dir, store) = tiered();
+        store.put_block("polkadot", &sample(3)).expect("put");
+        store.sync().expect("sync");
+        tier(&store, "polkadot", 0);
+        assert_eq!(
+            store.get_block("polkadot", 3).expect("get"),
+            Some(sample(3))
+        );
+
+        let mut corrected = sample(3);
+        corrected.events = vec![0xab; 12];
+        store.put_block("polkadot", &corrected).expect("put again");
+        store.sync().expect("sync");
+
+        assert_eq!(
+            store.get_block("polkadot", 3).expect("get"),
+            Some(corrected),
+            "the hot write must win over the cold copy it supersedes"
+        );
+    }
+
+    #[test]
+    fn the_hot_copy_survives_a_crash_before_the_delete() {
+        // Copy -> verify -> record -> delete, never delete-then-record. A crash anywhere in
+        // that sequence must leave two copies, which costs disk, rather than none.
+        let (dir, store) = tiered();
+        for n in 0..10u64 {
+            store.put_block("polkadot", &sample(n)).expect("put");
+        }
+        store.sync().expect("sync");
+
+        store.copy_to_cold("polkadot", 0).expect("copy");
+        assert!(
+            dir.path()
+                .join("hot/polkadot/blocks/000000000-000000009.seg")
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("cold/polkadot/blocks/000000000-000000009.seg")
+                .exists()
+        );
+
+        // Re-running the interrupted pass from the start is the whole recovery procedure.
+        tier(&store, "polkadot", 0);
+        assert_eq!(
+            store.get_block("polkadot", 5).expect("get"),
+            Some(sample(5))
+        );
+    }
+
+    #[test]
+    fn a_store_with_no_cold_tier_refuses_to_tier_rather_than_inventing_a_path() {
+        let (_dir, store) = store();
+        store.put_block("polkadot", &sample(0)).expect("put");
+        store.sync().expect("sync");
+
+        assert!(matches!(
+            store.copy_to_cold("polkadot", 0),
+            Err(StoreError::NoColdTier)
+        ));
+    }
+
+    #[test]
+    fn one_root_for_both_tiers_is_rejected() {
+        // A segment copied onto itself is a segment truncated to nothing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(matches!(
+            HotStore::open_tiered(dir.path(), Some(dir.path().to_path_buf()), 10),
+            Err(StoreError::ColdPathIsHotPath(_))
+        ));
+    }
+
+    #[test]
+    fn the_hot_tier_lists_what_it_holds_in_block_order() {
+        let (_dir, store) = tiered();
+        for n in 0..25u64 {
+            store.put_block("polkadot", &sample(n)).expect("put");
+        }
+        store.sync().expect("sync");
+
+        let spans = store.hot_segments("polkadot").expect("list");
+        assert_eq!(
+            spans.iter().map(|s| s.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!((spans[1].from_block, spans[1].to_block), (10, 19));
+        assert!(spans[0].modified.is_some(), "retention is judged from this");
+
+        tier(&store, "polkadot", 0);
+        assert_eq!(
+            store
+                .hot_segments("polkadot")
+                .expect("list")
+                .iter()
+                .map(|s| s.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "a tiered segment is no longer a candidate"
+        );
+    }
+
+    #[test]
+    fn metadata_stays_hot_when_the_blocks_move() {
+        // Losing a spec version's metadata makes every block that ran under it permanently
+        // undecodable even though the bytes are intact, so it is the one thing tiering — and
+        // any retention policy — must not touch.
+        let (dir, store) = tiered();
+        store.put_block("polkadot", &sample(0)).expect("put");
+        store
+            .put_metadata("polkadot", 1_022_002, &[9; 32])
+            .expect("put");
+        store.sync().expect("sync");
+
+        tier(&store, "polkadot", 0);
+
+        assert_eq!(
+            store.get_metadata("polkadot", 1_022_002).expect("get"),
+            Some(vec![9; 32])
+        );
+        assert!(dir.path().join("hot/polkadot/meta/1022002.scale").exists());
     }
 }

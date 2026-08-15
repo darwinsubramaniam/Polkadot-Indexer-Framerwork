@@ -64,6 +64,30 @@
 #
 # [pipeline]
 # hot_path = "/mnt/ssd/pif"
+# # A second, cheaper root. Digested segments move here once they have been on the fast disk
+# # for `retention`, and STAY REPLAYABLE from it: reads fall through, so `pif replay` over
+# # tiered history works exactly as it did before the move -- just off an HDD. Omit to keep
+# # everything hot. A segment is a file, so tiering is a file copy rather than a range
+# # scan-and-delete, and the move is copy -> fsync -> verify checksum -> record -> delete,
+# # never delete-then-record: a crash leaves two copies, not none.
+# #
+# # Runtime metadata is never tiered. Losing a spec version's metadata makes every block that
+# # ran under it permanently undecodable even though the bytes are intact, and it is a handful
+# # of megabytes for a chain's whole history.
+# cold_path = "/mnt/hdd/pif"
+# # How long a digested segment stays hot before `on_digest` applies to it. "30d", "12h",
+# # "45m", "10s" -- a bare number is rejected rather than guessed at. The default is 24h,
+# # which is the window in which a re-digest of what was just indexed is usually wanted.
+# retention = "30d"
+# # What happens then: archive | keep | delete.
+# #
+# #   archive  move it to `cold_path`. With no cold_path there is nowhere to move it, so it
+# #            stays hot -- which is why this is the default and does nothing on its own.
+# #   keep     leave it hot forever. The archive grows without bound, deliberately.
+# #   delete   FORFEITS REPLAY for that range. The blocks are gone and only the rows the
+# #            digest derived from them remain. For deployments that genuinely only want the
+# #            derived tables; `retention` already manages the disk without giving this up.
+# on_digest = "archive"
 # # Blocks per segment file. Segments are aligned, so a block's file is computed from its
 # # number rather than looked up -- which means changing this on an existing store makes
 # # everything already written unfindable. Choose it once.

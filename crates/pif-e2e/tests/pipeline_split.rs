@@ -47,6 +47,7 @@ fn chain_config(id: &str, dir: &std::path::Path, handlers: Vec<String>) -> Chain
             // runs the batched digest *and* its ragged final batch rather than a run that
             // happens to come out even.
             digest_batch: 7,
+            ..PipelineConfig::default()
         })
 }
 
@@ -305,6 +306,7 @@ async fn a_replay_needs_no_network_at_all() -> Result<()> {
         chunk_size: 4,
         max_digest_lag: None,
         digest_batch: 7,
+        ..PipelineConfig::default()
     });
 
     pipeline::replay(&pool, &unreachable, &pif_e2e::registry(), 0, LAST_BLOCK).await?;
@@ -340,6 +342,7 @@ async fn the_fetch_stage_will_not_outrun_the_digest() -> Result<()> {
         chunk_size: 4,
         max_digest_lag: Some(LAG),
         digest_batch: 7,
+        ..PipelineConfig::default()
     });
 
     // Fetch alone, with nothing digesting. It must archive up to the ceiling and then hold,
@@ -407,6 +410,7 @@ async fn a_tight_brake_does_not_deadlock_the_two_stages() -> Result<()> {
         // that waited to fill a batch would wait for blocks the brake has already stopped the
         // fetcher from producing. It commits what is ready instead, so this must still finish.
         digest_batch: 30,
+        ..PipelineConfig::default()
     });
 
     tokio::time::timeout(
@@ -561,6 +565,7 @@ async fn a_state_reading_handler_replays_with_no_network() -> Result<()> {
             chunk_size: 4,
             max_digest_lag: None,
             digest_batch: 7,
+            ..PipelineConfig::default()
         });
 
     pipeline::replay(&pool, &unreachable, &registry, 0, LAST_BLOCK).await?;
@@ -615,6 +620,7 @@ async fn an_unarchived_storage_read_stops_a_replay_by_name() -> Result<()> {
             chunk_size: 4,
             max_digest_lag: None,
             digest_batch: 7,
+            ..PipelineConfig::default()
         });
 
     let error = pipeline::replay(&pool, &config, &registry, 0, LAST_BLOCK)
@@ -654,6 +660,7 @@ fn multi_endpoint_config(id: &str, dir: &std::path::Path, urls: &[&str]) -> Chai
             chunk_size: 4,
             max_digest_lag: None,
             digest_batch: 7,
+            ..PipelineConfig::default()
         }),
     }
 }
@@ -857,6 +864,250 @@ async fn every_runtime_seen_is_archived_and_recorded() -> Result<()> {
     );
     assert_eq!(hash_len, 32, "metadata hash should be a sha256");
     assert!(transaction_version > 0);
+
+    Ok(())
+}
+
+/// A chain that tiers everything the digest is finished with, immediately.
+///
+/// `retention = 0` is not what a deployment would run — a day of hot history is the default,
+/// so a re-digest of what was just indexed stays on the fast disk. It is what a *test* runs,
+/// because the alternative is waiting a day.
+fn tiering_config(
+    id: &str,
+    hot: &std::path::Path,
+    cold: &std::path::Path,
+    on_digest: pif_core::OnDigest,
+) -> ChainConfig {
+    ChainConfig::rpc(id, dev_node_url()).with_pipeline(PipelineConfig {
+        hot_path: hot.to_path_buf(),
+        cold_path: Some(cold.to_path_buf()),
+        retention: std::time::Duration::ZERO,
+        on_digest,
+        // Three segments across the range, so the pass moves a prefix and has something left
+        // to leave behind rather than emptying the hot tier and proving nothing about order.
+        segment_size: 8,
+        chunk_size: 4,
+        max_digest_lag: None,
+        digest_batch: 7,
+    })
+}
+
+/// Segment files present under one root, by name.
+fn segment_files(root: &std::path::Path, chain_id: &str, kind: &str) -> Vec<String> {
+    let dir = root.join(chain_id).join(kind);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".seg"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// History moves to the cold tier and stays replayable.
+///
+/// The claim that makes tiering worth having rather than a fancy `rm`: after the move, the
+/// blocks are gone from the SSD, present on the HDD, and a replay over the same range
+/// produces the same rows it produced the first time. If the last part failed, tiering would
+/// be deletion with extra steps.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn tiered_history_is_gone_from_the_hot_tier_and_still_replayable() -> Result<()> {
+    let pool = pool().await?;
+    let hot = tempfile::tempdir()?;
+    let cold = tempfile::tempdir()?;
+    let chain_id = "e2e-cold-tier";
+    reset(&pool, chain_id).await?;
+
+    let config = tiering_config(
+        chain_id,
+        hot.path(),
+        cold.path(),
+        pif_core::OnDigest::Archive,
+    );
+    pipeline::run(
+        &pool,
+        &config,
+        &pif_e2e::registry(),
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+
+    let indexed = snapshot(&pool, chain_id).await?;
+    let hot_before = segment_files(hot.path(), chain_id, "blocks");
+    assert!(hot_before.len() >= 2, "nothing to tier: {hot_before:?}");
+
+    let report = pipeline::archive_once(&pool, &config).await?;
+    assert!(!report.moved_nothing(), "the pass moved nothing at all");
+    assert!(report.freed > 0, "nothing was reclaimed from the hot tier");
+
+    // The segment holding the last block is not fully digested-and-past — the range stops
+    // mid-segment — so a prefix moves and the tail stays. That is the shape the watermark
+    // depends on.
+    let hot_after = segment_files(hot.path(), chain_id, "blocks");
+    let cold_after = segment_files(cold.path(), chain_id, "blocks");
+    assert!(
+        hot_after.len() < hot_before.len(),
+        "hot tier unchanged: {hot_before:?} -> {hot_after:?}"
+    );
+    assert!(!cold_after.is_empty(), "nothing arrived on the cold tier");
+    for name in &cold_after {
+        assert!(
+            !hot_after.contains(name),
+            "{name} is on both tiers; the hot copy should have been deleted after the record"
+        );
+    }
+
+    // Recorded, with the checksum the copy was verified against.
+    let segments = pif_db::repo::segments(&pool, chain_id).await?;
+    assert_eq!(
+        segments.len(),
+        cold_after.len(),
+        "one row per cold segment, got {segments:?}"
+    );
+    for segment in &segments {
+        assert_eq!(segment.tier, "cold");
+        assert!(segment.bytes > 0);
+        assert_eq!(segment.checksum.len(), 4, "crc32, big-endian");
+    }
+
+    let marks = pif_db::repo::load_watermarks(&pool, chain_id)
+        .await?
+        .expect("watermarks");
+    let highest = segments
+        .iter()
+        .map(|s| s.to_block)
+        .max()
+        .expect("a segment");
+    assert_eq!(marks.archive, highest);
+    assert!(
+        marks.archive <= marks.digest,
+        "the archive watermark ran past the digest it is bounded by"
+    );
+
+    // The payoff. Replays against a dead address, so a fall back to the network cannot pass.
+    let replay_config = ChainConfig::rpc(chain_id, DEAD_URL).with_pipeline(PipelineConfig {
+        hot_path: hot.path().to_path_buf(),
+        cold_path: Some(cold.path().to_path_buf()),
+        retention: std::time::Duration::ZERO,
+        segment_size: 8,
+        chunk_size: 4,
+        max_digest_lag: None,
+        digest_batch: 7,
+        ..PipelineConfig::default()
+    });
+    pipeline::replay(&pool, &replay_config, &pif_e2e::registry(), 0, LAST_BLOCK).await?;
+
+    assert_eq!(
+        snapshot(&pool, chain_id).await?,
+        indexed,
+        "a replay across the tier boundary must produce the rows the first pass produced"
+    );
+
+    Ok(())
+}
+
+/// `on_digest = "delete"` frees the disk and forfeits the replay, loudly.
+///
+/// Asserted rather than assumed because it is the one setting that throws away something the
+/// chain will not always give back: nothing records the range, and a replay over it stops by
+/// name instead of quietly finding the blocks somewhere else.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn deleting_on_digest_gives_up_the_replay_it_frees_the_disk_for() -> Result<()> {
+    let pool = pool().await?;
+    let hot = tempfile::tempdir()?;
+    let cold = tempfile::tempdir()?;
+    let chain_id = "e2e-cold-delete";
+    reset(&pool, chain_id).await?;
+
+    let config = tiering_config(
+        chain_id,
+        hot.path(),
+        cold.path(),
+        pif_core::OnDigest::Delete,
+    );
+    pipeline::run(
+        &pool,
+        &config,
+        &pif_e2e::registry(),
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+
+    let report = pipeline::archive_once(&pool, &config).await?;
+    assert!(!report.moved_nothing());
+
+    assert!(
+        segment_files(cold.path(), chain_id, "blocks").is_empty(),
+        "delete must not quietly archive instead"
+    );
+    assert!(
+        pif_db::repo::segments(&pool, chain_id).await?.is_empty(),
+        "a deleted segment must leave no row naming a file nothing can read"
+    );
+
+    let error = pipeline::replay(&pool, &config, &pif_e2e::registry(), 0, 0)
+        .await
+        .expect_err("the blocks were deleted; a replay must not appear to succeed");
+    let text = error.to_string();
+    assert!(
+        text.contains("not archived") || text.contains("archive"),
+        "expected a named missing-block failure, got: {text}"
+    );
+
+    Ok(())
+}
+
+/// A segment the digest has not finished with must not move.
+///
+/// The bound that keeps tiering from pulling the floor out from under the stage standing on
+/// it. Here nothing has been digested at all, so nothing is eligible, however old the files
+/// are and whatever the retention says.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn an_undigested_segment_stays_hot() -> Result<()> {
+    let pool = pool().await?;
+    let hot = tempfile::tempdir()?;
+    let cold = tempfile::tempdir()?;
+    let chain_id = "e2e-cold-undigested";
+    reset(&pool, chain_id).await?;
+
+    let config = tiering_config(
+        chain_id,
+        hot.path(),
+        cold.path(),
+        pif_core::OnDigest::Archive,
+    );
+
+    // Fetch only: blocks are archived, the digest watermark never moves off -1.
+    pipeline::fetch_only(
+        &pool,
+        &config,
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+    assert!(!segment_files(hot.path(), chain_id, "blocks").is_empty());
+
+    let report = pipeline::archive_once(&pool, &config).await?;
+    assert!(
+        report.moved_nothing(),
+        "a segment the digest has not read was moved out from under it"
+    );
+    assert!(segment_files(cold.path(), chain_id, "blocks").is_empty());
 
     Ok(())
 }
