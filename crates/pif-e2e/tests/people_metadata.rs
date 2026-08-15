@@ -23,12 +23,7 @@ fn people_url() -> String {
 }
 
 fn config(url: &str) -> ChainConfig {
-    ChainConfig {
-        id: "people-dev".to_owned(),
-        ws_url: url.to_owned(),
-        start_block: 0,
-        handlers: Vec::new(),
-    }
+    ChainConfig::rpc("people-dev", url)
 }
 
 /// Alice's well-known sr25519 public key.

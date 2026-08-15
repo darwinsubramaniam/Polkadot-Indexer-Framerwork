@@ -15,8 +15,55 @@ pub enum ChainError {
     #[error("rpc call failed")]
     Rpc(#[from] subxt::rpcs::Error),
 
+    /// This binary has no light client compiled in.
+    ///
+    /// Smoldot is a heavy dependency that most deployments — which point at their own node
+    /// — never need, so it is behind a feature rather than always on.
+    #[error(
+        "chain {chain} is configured with a light-client source, but this binary was built \
+         without one.\n\
+         Rebuild with the `light-client` feature:\n  \
+           cargo build -p polkadot-indexer-cli --features light-client"
+    )]
+    LightClientUnavailable { chain: String },
+
+    #[error("failed to start the light client for chain {chain}")]
+    LightClient {
+        chain: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("failed to read chain spec {path} for chain {chain}")]
+    ChainSpecRead {
+        chain: String,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Something asked a light client for a block by number.
+    ///
+    /// Smoldot cannot verify a full node's claim that a given hash is block `n`, so it
+    /// refuses to answer at all. Backfill and `--from` are therefore rpc-only.
+    #[error(
+        "chain {chain}: cannot index block {number} with a light client.\n\
+         A light client verifies what it is told against the chain's finality proofs, and \
+         has no way to verify which block sits at a given height, so it can only follow the \
+         chain forward from the current finalized head.\n\
+         Switch this chain to an rpc source (an archive node, for history) to index it."
+    )]
+    LightClientCannotBackfill { chain: String, number: u64 },
+
     #[error("node returned no header for its own finalized head")]
     MissingFinalizedHeader,
+
+    #[error("failed to read the current finalized block on chain {chain}")]
+    CurrentBlock {
+        chain: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[error("failed to read block {number}")]
     BlockRead {

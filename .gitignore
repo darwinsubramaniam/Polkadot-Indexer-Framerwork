@@ -12,3 +12,6 @@
 
 # macOS
 .DS_Store
+
+# Chain specs fetched by scripts/fetch-chain-specs.sh — generated, ~300KB each.
+/config/specs/

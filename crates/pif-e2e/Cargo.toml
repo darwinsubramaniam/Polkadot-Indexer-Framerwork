@@ -24,6 +24,7 @@ default = []
 # Mirrors the indexer-chain feature so the typed-overlay test can be enabled.
 handler-balances = ["dep:pif-example-balances"]
 handler-identity = ["dep:pif-identity"]
+light-client = ["pif-chain/light-client"]
 
 [dependencies]
 pif-chain.workspace = true

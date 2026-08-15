@@ -70,12 +70,7 @@ async fn indexes_a_freshly_spawned_chain_with_no_recompile() -> Result<()> {
         .execute(&pool)
         .await?;
 
-    let config = ChainConfig {
-        id: chain_id.to_owned(),
-        ws_url,
-        start_block: 0,
-        handlers: vec![],
-    };
+    let config = ChainConfig::rpc(chain_id, ws_url);
 
     // Wait until the chain has finalized enough blocks to be worth indexing.
     let client = pif_chain::ChainClient::connect(&config).await?;

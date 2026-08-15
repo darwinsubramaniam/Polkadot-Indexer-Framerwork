@@ -82,7 +82,7 @@ Inspecting what landed:
 
 ```sh
 just status                        # every chain and how far it has been indexed
-just gaps                          # holes in the stored chain — always 0
+just gaps                          # holes in the stored chain — 0, unless a light-client chain restarted
 just transfers <chain-id>          # typed-overlay transfers
 just transfer-events <chain-id>    # the same, as the dynamic core stored them
 just events <chain-id>             # most common events, a quick decode sanity check
@@ -98,6 +98,7 @@ Both are **off by default**, so a plain build is just the indexing pipeline.
 | Feature | Adds |
 |---|---|
 | `api` | the GraphQL server (`serve`). Pulls ~57 crates — async-graphql, axum — that the pipeline never needs, so it is opt-in. Running `serve` without it prints how to enable it. |
+| `light-client` | lets a chain be indexed through an in-process smoldot light client instead of an RPC node — see [Chain sources](#chain-sources). Adds ~100 crates, including a whole Substrate client, so it is opt-in. A light-client chain in the config fails with instructions if the binary lacks it. |
 | `handler-balances` | registers the reference handler from `crates/example`, populating a `transfers` table |
 | `handler-identity` | registers the `identity` handler for the Polkadot People chain: display names, registrar judgements, sub-identities and usernames. With `api`, also merges an `identity` GraphQL root into the schema. |
 
@@ -268,6 +269,68 @@ handlers    = []            # or ["balances-transfer"]
 Chain name, token symbol/decimals, SS58 prefix and genesis hash are read from the node on
 first connect and stored in the `chains` table.
 
+## Chain sources
+
+How the indexer *reaches* a chain is a config choice too. `ws_url` above is shorthand for an
+RPC source; the long form names the transport explicitly:
+
+```toml
+[[chains]]
+id = "polkadot-people"
+handlers = ["identity"]
+
+[chains.source]
+type = "rpc"
+url  = "wss://polkadot-people-rpc.polkadot.io"
+```
+
+```toml
+[[chains]]
+id = "polkadot-people-lc"
+handlers = ["identity"]
+
+[chains.source]
+type = "light-client"
+chain_spec       = "specs/polkadot-people.json"
+relay_chain_spec = "specs/polkadot.json"     # a parachain's finality is the relay's
+# bootnodes      = ["/ip4/…/tcp/30333/p2p/12D3Koo…"]   # override the spec's, e.g. local nets
+```
+
+```sh
+just fetch-chain-specs          # downloads specs into config/specs/
+just index-light                # same as `just index`, with smoldot compiled in
+```
+
+The two are not interchangeable, and the difference is not about convenience:
+
+| | `rpc` | `light-client` |
+|---|---|---|
+| Trust | the node operator's word | the chain's own finality proofs |
+| Backfill history | yes, from an archive node | **no** |
+| `start_block` / `--from` | honoured | rejected — see below |
+| Indexes | any range | forward from the current finalized head |
+| Needs | an endpoint | a chain spec, and ~30-60s to warp-sync on start |
+| Build | default | `--features light-client` |
+
+A light client cannot answer "what is the hash of block N". That is not a missing feature:
+it verifies everything it is told against the finality proofs it has followed, and a full
+node's claim that some hash sits at height N is exactly the kind of assertion it has no way
+to check. So it can only index blocks a finality subscription hands it.
+
+The framework treats that as a hard constraint rather than papering over it:
+
+* `start_block` on a light-client chain is a **config error**, not a silently ignored field.
+* `--from` on one is an error, raised before the sync starts rather than after.
+* A gap — from a restart, or a subscription that skipped ahead — is logged as a warning
+  naming the exact missing range, because nothing in the process can fill it back in.
+
+Indexing a chain's history *and* following it trustlessly is two entries: one `rpc` chain
+that backfills, one `light-client` chain that follows. They can share nothing else, since a
+chain id is a primary key.
+
+Chains that name the same `relay_chain_spec` share a single relay-chain sync, so indexing
+five Polkadot parachains in one process costs one relay light client, not five.
+
 ## Design decisions worth knowing
 
 **Handlers can read chain state, not just events.** `BlockContext::storage` exposes the
@@ -329,7 +392,15 @@ just test-zombienet      # spawns throwaway networks
 just test-all            # everything
 ```
 
-`just lint` deliberately runs clippy under **three** feature combinations. A `cfg`-gated
+The light-client suite needs neither a node nor a database — it syncs live Polkadot from
+nothing but a chain spec, which takes about a minute:
+
+```sh
+just fetch-chain-specs
+cargo test -p pif-e2e --features light-client --test light_client -- --ignored --nocapture
+```
+
+`just lint` deliberately runs clippy under **four** feature combinations. A `cfg`-gated
 crate can pass in one configuration and fail in another — an unused import behind a feature
 flag is invisible until you build without it.
 

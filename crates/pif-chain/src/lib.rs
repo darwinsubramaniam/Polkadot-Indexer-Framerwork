@@ -8,6 +8,8 @@ pub mod client;
 pub mod decode;
 pub mod error;
 pub mod handlers;
+#[cfg(feature = "light-client")]
+pub mod light_client;
 pub mod pipeline;
 pub mod storage;
 

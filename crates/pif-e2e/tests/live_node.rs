@@ -15,12 +15,7 @@ use sqlx::{PgPool, Row};
 
 /// Each test gets its own chain id so runs do not fight over the same rows.
 fn chain_config(id: &str, handlers: Vec<String>) -> ChainConfig {
-    ChainConfig {
-        id: id.to_owned(),
-        ws_url: dev_node_url(),
-        start_block: 0,
-        handlers,
-    }
+    ChainConfig::rpc(id, dev_node_url()).with_handlers(handlers)
 }
 
 async fn pool() -> Result<PgPool> {

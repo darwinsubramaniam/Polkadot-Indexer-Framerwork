@@ -52,6 +52,33 @@ pub async fn at_block(
     })
 }
 
+/// Subxt's view of the chain at the block the finality subscription just delivered.
+///
+/// The stream hands back a pinned block reference, so this needs no number-to-hash lookup —
+/// which is what makes it the only usable entry point under a light client.
+pub async fn at_streamed_block(block: &subxt::client::Block<PolkadotConfig>) -> Result<AtBlock> {
+    block.at().await.map_err(|source| ChainError::BlockRead {
+        number: block.number(),
+        source: Box::new(source),
+    })
+}
+
+/// Subxt's view of the chain at the current finalized block.
+///
+/// The only block a light client can name without being told about it first.
+pub async fn at_current_block(
+    client: &OnlineClient<PolkadotConfig>,
+    chain: &ChainInfo,
+) -> Result<AtBlock> {
+    client
+        .at_current_block()
+        .await
+        .map_err(|source| ChainError::CurrentBlock {
+            chain: chain.id.clone(),
+            source: Box::new(source),
+        })
+}
+
 /// Fetch and decode a single block.
 pub async fn decode_block(
     client: &OnlineClient<PolkadotConfig>,

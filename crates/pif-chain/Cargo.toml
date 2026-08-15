@@ -13,6 +13,11 @@ categories = ["database", "command-line-utilities"]
 [features]
 default = []
 
+# In-process smoldot light client, selectable per chain via `[chains.source]`. Off by
+# default: smoldot is a large dependency (it is a whole Substrate client), and a deployment
+# pointing at its own node never needs it.
+light-client = ["subxt/light-client"]
+
 [lib]
 # Short import name: `use pif_chain::…`. The published package name is longer for
 # discoverability on crates.io; Cargo allows the two to differ.

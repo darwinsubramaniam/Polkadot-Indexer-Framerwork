@@ -1,6 +1,6 @@
 //! Connecting to a chain and discovering what it is.
 
-use pif_core::{ChainConfig, ChainInfo, ss58};
+use pif_core::{ChainConfig, ChainInfo, ChainSource, ss58};
 use subxt::{
     OnlineClient, PolkadotConfig,
     config::RpcConfigFor,
@@ -26,25 +26,26 @@ impl ChainClient {
     /// Nothing chain-specific is compiled in: the name, token, SS58 prefix and genesis hash
     /// all come from the node. That is what lets the same binary index a chain it has never
     /// seen before, purely from config.
+    ///
+    /// The transport — somebody's RPC node, or an in-process light client — is a config
+    /// choice, and everything above this function is written against whichever one the
+    /// config named. See [`ChainSource`] for what each can and cannot do.
     pub async fn connect(config: &ChainConfig) -> Result<Self> {
-        // `from_url` requires TLS; local dev nodes and zombienet both speak plain ws://.
-        let rpc_client = if config.ws_url.starts_with("wss://") {
-            RpcClient::from_url(&config.ws_url).await
-        } else {
-            RpcClient::from_insecure_url(&config.ws_url).await
-        }
-        .map_err(|source| ChainError::Connect {
-            chain: config.id.clone(),
-            url: config.ws_url.clone(),
-            source: Box::new(source),
-        })?;
+        let rpc_client = match &config.source {
+            ChainSource::Rpc { url } => rpc_transport(&config.id, url).await?,
+            ChainSource::LightClient { .. } => light_client_transport(config)?,
+        };
 
         let rpc = Rpc::new(rpc_client.clone());
+
+        // Subxt picks its own backend from what the endpoint advertises: `archive_v1_` if
+        // the node has it, otherwise `chainHead_v1_` (which is all a light client speaks),
+        // otherwise the legacy methods.
         let client = OnlineClient::<PolkadotConfig>::from_rpc_client(rpc_client)
             .await
             .map_err(|source| ChainError::Connect {
                 chain: config.id.clone(),
-                url: config.ws_url.clone(),
+                url: config.source.to_string(),
                 source: Box::new(source),
             })?;
 
@@ -63,6 +64,35 @@ impl ChainClient {
 
         Ok(header.number)
     }
+}
+
+/// Open a WebSocket connection to a node.
+async fn rpc_transport(chain_id: &str, url: &str) -> Result<RpcClient> {
+    // `from_url` requires TLS; local dev nodes and zombienet both speak plain ws://.
+    let client = if url.starts_with("wss://") {
+        RpcClient::from_url(url).await
+    } else {
+        RpcClient::from_insecure_url(url).await
+    };
+
+    client.map_err(|source| ChainError::Connect {
+        chain: chain_id.to_owned(),
+        url: url.to_owned(),
+        source: Box::new(source),
+    })
+}
+
+/// Start (or join) an in-process light client for this chain.
+#[cfg(feature = "light-client")]
+fn light_client_transport(config: &ChainConfig) -> Result<RpcClient> {
+    crate::light_client::connect(config)
+}
+
+#[cfg(not(feature = "light-client"))]
+fn light_client_transport(config: &ChainConfig) -> Result<RpcClient> {
+    Err(ChainError::LightClientUnavailable {
+        chain: config.id.clone(),
+    })
 }
 
 /// Read a chain's identity from the node itself.

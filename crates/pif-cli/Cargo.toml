@@ -25,6 +25,10 @@ api = ["dep:pif-api", "dep:axum", "dep:async-graphql", "pif-identity?/api"]
 # downstream project registers its own instead.
 handler-balances = ["dep:pif-example-balances"]
 
+# Lets a chain be indexed through an in-process light client instead of somebody's RPC
+# node. Adds smoldot (~100 crates), so it is opt-in like the API.
+light-client = ["pif-chain/light-client"]
+
 # Identity / alias indexing for the Polkadot People chain. Adds the `identity` handler and,
 # together with `api`, an `identity` GraphQL root merged into the framework schema.
 handler-identity = ["dep:pif-identity"]

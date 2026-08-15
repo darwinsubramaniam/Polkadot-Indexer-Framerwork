@@ -51,12 +51,7 @@ const ALICE: [u8; 32] = [
 async fn generate_people_registrar_override() {
     let url = std::env::var("PEOPLE_WS_URL").unwrap_or_else(|_| "ws://127.0.0.1:9955".to_owned());
 
-    let config = ChainConfig {
-        id: "people-dev".to_owned(),
-        ws_url: url.clone(),
-        start_block: 0,
-        handlers: Vec::new(),
-    };
+    let config = ChainConfig::rpc("people-dev", url.clone());
 
     let Ok(client) = ChainClient::connect(&config).await else {
         eprintln!("skipping: no People node at {url}; run `just zn-up`");

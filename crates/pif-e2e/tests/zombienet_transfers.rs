@@ -86,12 +86,7 @@ async fn records_transfers_made_on_a_freshly_spawned_chain() -> Result<()> {
         .execute(&pool)
         .await?;
 
-    let config = ChainConfig {
-        id: chain_id.to_owned(),
-        ws_url: ws_url.clone(),
-        start_block: 0,
-        handlers: vec!["balances-transfer".to_owned()],
-    };
+    let config = ChainConfig::rpc(chain_id, ws_url.clone()).with_handlers(["balances-transfer"]);
 
     // ---- submit real transfers -------------------------------------------------------
     let api = OnlineClient::<PolkadotConfig>::from_insecure_url(&ws_url)

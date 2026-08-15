@@ -70,6 +70,11 @@ index *ARGS:
 index-to TO:
     cargo run -p polkadot-indexer-cli {{ALL}} -- index --to {{TO}}
 
+# Index with the light-client source available. Separate from `index` because smoldot is a
+# ~100-crate dependency and the first build of it is slow.
+index-light *ARGS:
+    cargo run -p polkadot-indexer-cli {{ALL}},light-client -- index {{ARGS}}
+
 # Serve the GraphQL API (GraphiQL on http://localhost:8000).
 serve *ARGS:
     cargo run -p polkadot-indexer-cli {{ALL}} -- serve {{ARGS}}
@@ -144,7 +149,8 @@ events CHAIN:
     @{{PSQL}} -c "SELECT pallet, variant, count(*) FROM events \
         WHERE chain_id = '{{CHAIN}}' GROUP BY 1,2 ORDER BY 3 DESC LIMIT 20;"
 
-# Verify the stored chain has no holes. Should print 0 for every chain.
+# Verify the stored chain has no holes. Should print 0 for every chain — except one
+# followed by a light client, which cannot backfill what it missed while stopped.
 gaps:
     @{{PSQL}} -c "SELECT c.id, (SELECT count(*) FROM generate_series( \
             (SELECT min(number) FROM blocks WHERE chain_id = c.id), \
@@ -178,6 +184,10 @@ test-all: test test-e2e test-zombienet
 fetch-zombie-cli:
     ./scripts/fetch-zombie-cli.sh
 
+# Download chain specs for the light-client source into config/specs/.
+fetch-chain-specs *SPECS:
+    ./scripts/fetch-chain-specs.sh {{SPECS}}
+
 # ---------------------------------------------------------------- quality
 
 fmt:
@@ -192,6 +202,7 @@ lint:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy --workspace --all-targets --features api -- -D warnings
     cargo clippy --workspace --all-targets --features handler-identity -- -D warnings
+    cargo clippy --workspace --all-targets --features light-client -- -D warnings
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # What CI should run.

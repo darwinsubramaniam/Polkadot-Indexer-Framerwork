@@ -7,7 +7,7 @@ use pif_db::repo;
 use sqlx::PgPool;
 
 use crate::client::ChainClient;
-use crate::decode;
+use crate::decode::{self, AtBlock};
 use crate::error::{ChainError, Result};
 use crate::handlers::{BlockContext, HandlerRegistry, Selected};
 use crate::storage::SubxtStorage;
@@ -38,6 +38,17 @@ pub async fn run(
     registry: &HandlerRegistry,
     options: IndexOptions,
 ) -> Result<()> {
+    // Checked before connecting: starting a light client means warp-syncing before anything
+    // happens at all, and a request it can never satisfy should not cost that first.
+    if let Some(from) = options.from
+        && !config.can_backfill()
+    {
+        return Err(ChainError::LightClientCannotBackfill {
+            chain: config.id.clone(),
+            number: from,
+        });
+    }
+
     let chain = ChainClient::connect(config).await?;
     tracing::info!(chain = %chain.info, "connected");
 
@@ -56,6 +67,12 @@ pub async fn run(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_owned();
+
+    // A light client cannot resolve a block *number* at all, so there is nothing to catch
+    // up from: it starts at whatever the finality subscription hands it first.
+    if !config.can_backfill() {
+        return follow_only(pool, config, &chain, handlers, &spec_name, &options).await;
+    }
 
     let start = match options.from {
         Some(from) => from,
@@ -87,7 +104,7 @@ pub async fn run(
     // Catch-up: serial by design in M1. Parallel backfill is a later milestone.
     let catch_up_end = options.stop_at.map(|s| s.min(target)).unwrap_or(target);
     for number in start..=catch_up_end {
-        persist(pool, &chain, handlers, &spec_name, number).await?;
+        persist_number(pool, &chain, handlers, &spec_name, number).await?;
 
         if number % 100 == 0 || number == catch_up_end {
             tracing::info!(chain = %config.id, block = number, "indexed");
@@ -102,6 +119,39 @@ pub async fn run(
     }
 
     follow_head(pool, config, &chain, handlers, &spec_name, options.stop_at).await
+}
+
+/// Start a light-client chain, which can only ever go forwards.
+///
+/// There is no catch-up phase here, and no `start_block`, because smoldot has no verifiable
+/// answer to "what is block N": it would have to take a full node's word for it, which is
+/// the exact assumption a light client exists to avoid. Rather than silently indexing a
+/// shorter history than asked for, an impossible request is an error (`--from`, and
+/// `start_block` at config load) and an unavoidable gap is a loud warning.
+async fn follow_only(
+    pool: &PgPool,
+    config: &ChainConfig,
+    chain: &ChainClient,
+    handlers: &Selected<'_>,
+    spec_name: &str,
+    options: &IndexOptions,
+) -> Result<()> {
+    // A gap left by a restart is reported by `follow_head` once the first block arrives,
+    // alongside the identical case of the subscription skipping blocks while running.
+
+    // Handlers that project state are seeded from the current finalized block: it is the
+    // oldest state a light client can prove anything about.
+    if !handlers.is_empty() {
+        let at = decode::at_current_block(&chain.client, &chain.info).await?;
+        let number = at.block_number();
+        let storage = SubxtStorage::new(&at, &chain.info.id);
+
+        tracing::info!(chain = %config.id, block = number, "bootstrapping handlers");
+        handlers.bootstrap(&chain.info, &storage, pool).await?;
+    }
+
+    tracing::info!(chain = %config.id, "light client: following the finalized head");
+    follow_head(pool, config, chain, handlers, spec_name, options.stop_at).await
 }
 
 /// Follow the finalized head, reconnecting if the subscription drops.
@@ -144,9 +194,38 @@ async fn follow_head(
                 None => number,
             };
 
-            for n in expected..=number {
-                index_one(pool, config, chain, handlers, spec_name, n).await?;
+            // Already stored — a reconnect can replay the block we stopped on.
+            if number < expected {
+                continue;
             }
+
+            if expected < number {
+                if config.can_backfill() {
+                    for n in expected..number {
+                        index_one(pool, config, chain, handlers, spec_name, n).await?;
+                    }
+                } else {
+                    // Either the indexer was stopped for a while, or the subscription
+                    // skipped ahead. Both leave the same hole, and a light client cannot
+                    // fetch any of it back — so say so loudly rather than let the stored
+                    // chain quietly stop being contiguous.
+                    tracing::warn!(
+                        chain = %config.id,
+                        missing_from = expected,
+                        missing_to = number - 1,
+                        blocks = number - expected,
+                        "gap that a light client cannot backfill; index this range from an \
+                         rpc source if you need it"
+                    );
+                }
+            }
+
+            // Indexed from the reference the stream handed us rather than by number: the
+            // hash is already known and pinned, which saves a lookup on an rpc source and
+            // is the only way through at all on a light client.
+            let at = decode::at_streamed_block(&block).await?;
+            persist(pool, chain, handlers, spec_name, &at).await?;
+            tracing::debug!(chain = %config.id, block = number, "indexed");
 
             if let Some(stop) = stop_at
                 && number >= stop
@@ -168,9 +247,24 @@ async fn index_one(
     spec_name: &str,
     number: u64,
 ) -> Result<()> {
-    persist(pool, chain, handlers, spec_name, number).await?;
+    persist_number(pool, chain, handlers, spec_name, number).await?;
     tracing::debug!(chain = %config.id, block = number, "indexed");
     Ok(())
+}
+
+/// Resolve a block by number, then commit it.
+///
+/// Only reachable for sources that can answer "what is block N" — see
+/// [`pif_core::ChainSource`].
+async fn persist_number(
+    pool: &PgPool,
+    chain: &ChainClient,
+    handlers: &Selected<'_>,
+    spec_name: &str,
+    number: u64,
+) -> Result<()> {
+    let at = decode::at_block(&chain.client, &chain.info, number).await?;
+    persist(pool, chain, handlers, spec_name, &at).await
 }
 
 /// Decode one block and commit it, together with whatever its handlers derive.
@@ -182,14 +276,15 @@ async fn persist(
     chain: &ChainClient,
     handlers: &Selected<'_>,
     spec_name: &str,
-    number: u64,
+    at: &AtBlock,
 ) -> Result<()> {
-    let (at, mut data) = decode::decode_block(&chain.client, &chain.info, number).await?;
+    let number = at.block_number();
+    let mut data = decode::decode_at(at, &chain.info).await?;
     data.spec_name = spec_name.to_owned();
 
     // State at this exact block, for handlers whose pallet reports *that* something changed
     // without reporting *what* it changed to.
-    let storage = SubxtStorage::new(&at, &chain.info.id);
+    let storage = SubxtStorage::new(at, &chain.info.id);
 
     let ctx = BlockContext {
         chain: &chain.info,
@@ -224,7 +319,7 @@ async fn guard_chain_identity(
     if stored != chain.info.genesis_hash {
         return Err(ChainError::GenesisMismatch {
             chain: config.id.clone(),
-            url: config.ws_url.clone(),
+            url: config.source.to_string(),
             stored: hex::encode(&stored),
             found: hex::encode(&chain.info.genesis_hash),
         });

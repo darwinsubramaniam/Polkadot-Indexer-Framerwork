@@ -129,18 +129,8 @@ async fn hub_transfers_resolve_to_people_chain_aliases() -> Result<()> {
             .await?;
     }
 
-    let hub_config = ChainConfig {
-        id: HUB_CHAIN_ID.to_owned(),
-        ws_url: hub_url(),
-        start_block: 0,
-        handlers: vec!["balances-transfer".to_owned()],
-    };
-    let people_config = ChainConfig {
-        id: PEOPLE_CHAIN_ID.to_owned(),
-        ws_url: people_url(),
-        start_block: 0,
-        handlers: vec!["identity".to_owned()],
-    };
+    let hub_config = ChainConfig::rpc(HUB_CHAIN_ID, hub_url()).with_handlers(["balances-transfer"]);
+    let people_config = ChainConfig::rpc(PEOPLE_CHAIN_ID, people_url()).with_handlers(["identity"]);
 
     // The cross-chain join matches on SS58 text, so the two chains must render the same key
     // identically. Asset Hub and People both use prefix 42 on Westend (0 on Polkadot); a

@@ -4,6 +4,25 @@
 # adding a block here — no code change, no recompile. Everything else about a chain
 # (its name, SS58 prefix, token symbol/decimals, genesis hash) is discovered from the
 # node on first connect and recorded in the `chains` table.
+#
+# Each chain names a source — how the indexer reaches it:
+#
+#   [chains.source]
+#   type = "rpc"                       # somebody's node, over WebSocket
+#   url  = "wss://…"
+#
+#   [chains.source]
+#   type = "light-client"              # smoldot, in-process, trusts nobody
+#   chain_spec = "specs/polkadot.json"
+#
+# `ws_url = "…"` at the top level is still accepted as shorthand for an rpc source.
+#
+# The two are not interchangeable. An rpc source can fetch any block by number, so it can
+# backfill history (from an archive node) and is the only way to index the past. A light
+# client verifies headers against the chain's own finality proofs and so trusts no node
+# operator — but it cannot map a block *number* to a hash (there is no way to verify such an
+# answer), so it only ever follows the finalized head forward from the moment it starts.
+# Requires building with `--features light-client`.
 
 [[chains]]
 # Stable key. Becomes the primary key in every table, so don't rename it casually.
@@ -21,9 +40,12 @@ handlers = []
 #
 # [[chains]]
 # id = "para-1000"
-# ws_url = "ws://127.0.0.1:9988"
 # start_block = 0
 # handlers = ["balances-transfer"]
+#
+# [chains.source]
+# type = "rpc"
+# url = "ws://127.0.0.1:9988"
 
 # The Polkadot People chain: identities, registrar judgements, sub-identities and usernames.
 # Requires building with `--features handler-identity`.
@@ -39,3 +61,24 @@ handlers = []
 # ws_url = "wss://polkadot-people-rpc.polkadot.io"
 # start_block = 0
 # handlers = ["identity"]
+
+# The same People chain, followed by a light client instead — no node operator to trust, and
+# no endpoint to be rate-limited by. `just fetch-chain-specs` downloads the specs.
+#
+# A parachain's finality is its relay chain's finality, so a light client has to sync the
+# relay too: name it with `relay_chain_spec`. Every chain here naming the same relay spec
+# shares one relay-chain sync, so indexing five parachains of Polkadot costs one.
+#
+# Indexing starts at the current finalized head — `start_block` is rejected for a light
+# client rather than silently ignored — so the identity handler's opening sweep of
+# `IdentityOf` is what gives you the pre-existing identities.
+#
+# [[chains]]
+# id = "polkadot-people-lc"
+# handlers = ["identity"]
+#
+# [chains.source]
+# type = "light-client"
+# chain_spec = "specs/polkadot-people.json"
+# relay_chain_spec = "specs/polkadot.json"
+# # bootnodes = ["/ip4/…/tcp/30333/p2p/12D3Koo…"]   # override the spec's, e.g. for a local net
