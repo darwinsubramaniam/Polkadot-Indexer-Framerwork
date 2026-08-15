@@ -1548,9 +1548,26 @@ Three things about the upgrade-boundary network are load-bearing and easy to get
 * restart-resume across the split: kill after fetch but before digest, restart, confirm no
   gap and no duplicate — the direct successor to
   `indexes_a_live_chain_and_resumes_after_restart`
-* `tests/replay_offline.rs` — index 0..200 with `handler-identity`, then point the node URL at
-  a dead address and replay the same range. It must succeed. **This is the single test that
-  proves the proposal's central claim.**
+* `tests/replay_offline.rs` — **written and passing.** Indexes the zombienet People chain with
+  `handler-identity`, then points the node URL at a dead address and replays the same range,
+  requiring the identity projection to come back byte-identical. **This is the single test
+  that proves the proposal's central claim**, and `pif-identity` is what makes it worth
+  asserting: it resolves nearly everything through chain *state* rather than event payloads,
+  so it exercises `IdentityOf`, `SuperOf`, `SubsOf`, `UsernameInfoOf`, `PendingUsernames` and
+  `Registrars` in one pass — including the sub-identity accounts, whose `IdentityOf` is a
+  genuine `Ok(None)` and therefore the negative-caching case.
+
+  `identity_registrars` is deliberately outside the comparison: it is seeded by the bootstrap
+  sweep, which is `iter`, excluded from the cache (§6.2) and not re-run by a replay. Asserting
+  on it would be claiming something this design does not offer.
+
+  Run with `just zn-up` then `just zn-replay-offline`. It wants a **fresh** network, like
+  the upgrade-boundary test: it claims a username and has registrar #0 judge an identity,
+  neither of which can happen twice on one chain.
+* `crates/pif-e2e/tests/pipeline_split.rs` — the same claim against the plain compose node,
+  with a purpose-built state-reading handler. Faster and needs no parachain, so it is the one
+  that runs routinely; the identity test above is what proves it on the handler people
+  actually deploy.
 * tiering: archive 0..100, confirm `segments.tier = 'cold'`, files exist under `cold_path`, are
   gone from `hot_path`, and a replay of 0..100 still succeeds
 

@@ -172,6 +172,19 @@ test-offline-decode:
 test-pipeline-split: up
     cargo test -p pif-e2e --test pipeline_split -- --ignored --nocapture --test-threads=1
 
+# The claim the whole archive rests on (IPD-002 §14): index the People chain with the
+# identity handler, then replay the same range against a dead address.
+#
+# `pif-identity` resolves almost everything through chain *state* rather than event payloads,
+# so if any of its reads is unarchived — or archived under a key that does not match on the
+# way back — this fails instead of quietly re-downloading.
+#
+# Wants a FRESH network: it claims a username and has registrar #0 judge an identity, neither
+# of which can happen twice on the same chain.
+zn-replay-offline:
+    cargo test -p pif-e2e --features handler-identity \
+        --test replay_offline -- --ignored --nocapture
+
 # The alias cross-check end to end: transfers on the hub, identities on People, one join.
 zn-alias-demo:
     cargo test -p pif-e2e --features handler-balances,handler-identity \

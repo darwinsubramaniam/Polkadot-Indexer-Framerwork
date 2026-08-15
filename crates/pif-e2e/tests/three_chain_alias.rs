@@ -18,7 +18,10 @@
 
 #![cfg(all(feature = "handler-balances", feature = "handler-identity"))]
 
+mod common;
+
 use anyhow::{Context, Result};
+use common::identity::{data_raw, identity_info, keypair};
 use pif_chain::{IndexOptions, pipeline};
 use pif_core::{ChainConfig, ss58};
 use pif_e2e::database_url;
@@ -26,7 +29,6 @@ use sqlx::{PgPool, Row};
 use subxt::config::Hasher;
 use subxt::config::substrate::BlakeTwo256;
 use subxt::{OnlineClient, PolkadotConfig, dynamic::Value, transactions::dynamic};
-use subxt_signer::sr25519::{Keypair, dev};
 
 const HUB_CHAIN_ID: &str = "zn-asset-hub";
 const PEOPLE_CHAIN_ID: &str = "zn-people";
@@ -46,17 +48,6 @@ const CAST: [(&str, &str, u128); 3] = [
     ("charlie", "Charlie Chaplin", 9_007_199_254_740_993), // 2^53 + 1
 ];
 
-fn keypair(name: &str) -> Keypair {
-    match name {
-        "alice" => dev::alice(),
-        "bob" => dev::bob(),
-        "charlie" => dev::charlie(),
-        "dave" => dev::dave(),
-        "eve" => dev::eve(),
-        other => panic!("unknown dev account {other}"),
-    }
-}
-
 /// Accounts that get no identity of their own, only a sub-identity under Alice. Resolving
 /// these is the case a naive lookup gets wrong: `IdentityOf` is empty for both.
 const SUBS: [(&str, &str); 2] = [("dave", "validator-01"), ("eve", "validator-02")];
@@ -64,35 +55,9 @@ const SUBS: [(&str, &str); 2] = [("dave", "validator-01"), ("eve", "validator-02
 /// The suffix Alice is the username authority for, installed at genesis by the network spec.
 const SUFFIX: &str = "pif";
 
-/// `Data::RawN(bytes)` — how `pallet_identity` stores a short text field.
-fn data_raw(text: &str) -> Value {
-    Value::unnamed_variant(format!("Raw{}", text.len()), [Value::from_bytes(text)])
-}
-
-fn data_none() -> Value {
-    Value::unnamed_variant("None", [])
-}
-
-/// `people_westend_runtime::people::IdentityInfo`.
-///
-/// The field list is runtime-specific — the People chains carry `matrix`/`github`/`discord`
-/// and drop the relay chain's legacy `additional`. It is read from live metadata by
-/// `people_metadata::print_identity_info_shape`, and encoding fails loudly if it drifts,
-/// which is what we want: a silently half-encoded identity would be worse.
-fn identity_info(display: &str) -> Value {
-    Value::named_composite([
-        ("display", data_raw(display)),
-        ("legal", data_none()),
-        ("web", data_none()),
-        ("matrix", data_none()),
-        ("email", data_none()),
-        ("pgp_fingerprint", Value::unnamed_variant("None", [])),
-        ("image", data_none()),
-        ("twitter", data_none()),
-        ("github", data_none()),
-        ("discord", data_none()),
-    ])
-}
+// `data_raw`, `identity_info` and `keypair` live in `common::identity`: `IdentityInfo` is
+// runtime-shaped, and two copies of it would drift into a half-encoded identity rather than
+// into a compile error.
 
 async fn connect(url: &str, what: &str) -> Option<OnlineClient<PolkadotConfig>> {
     match OnlineClient::<PolkadotConfig>::from_insecure_url(url).await {
