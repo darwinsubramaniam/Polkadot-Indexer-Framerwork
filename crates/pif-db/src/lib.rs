@@ -3,7 +3,9 @@
 pub mod models;
 pub mod repo;
 
-pub use models::{BlockData, Cursor, NewBlock, NewEvent, NewExtrinsic};
+pub use models::{
+    ArchivedRuntime, BlockData, Cursor, NewBlock, NewEvent, NewExtrinsic, Watermarks,
+};
 pub use repo::DbResult;
 
 use sqlx::postgres::{PgPool, PgPoolOptions};

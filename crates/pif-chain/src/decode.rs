@@ -6,19 +6,30 @@
 
 use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
+use parity_scale_codec::{Decode, Encode};
 use pif_core::{ChainInfo, codec, ss58};
 use pif_db::{BlockData, NewBlock, NewEvent, NewExtrinsic};
+use pif_store::RawBlock;
 use scale_value::Composite;
 use subxt::{
-    OnlineClient, PolkadotConfig,
-    client::{ClientAtBlock, OnlineClientAtBlockImpl},
-    events::Phase,
+    Config, OnlineClient, PolkadotConfig,
+    client::{ClientAtBlock, OfflineClientAtBlockT, OnlineClientAtBlockImpl},
+    config::Hasher,
+    events::{Events, Phase},
+    extrinsics::Extrinsics,
 };
 
 use crate::error::{ChainError, Result};
 
 /// Subxt's view of a chain at one block, for the concrete config we support.
+///
+/// Online-specific, and deliberately not used by [`decode_core`]: writing the decode core
+/// against this alias is exactly what would force the online client back into the offline
+/// path and quietly make a replay need a network.
 pub type AtBlock = ClientAtBlock<PolkadotConfig, OnlineClientAtBlockImpl<PolkadotConfig>>;
+
+/// This chain's header type, as archived and read back.
+type Header = <PolkadotConfig as Config>::Header;
 
 /// A decoded block plus the live event handles the typed overlay needs.
 pub struct DecodedBlock {
@@ -109,7 +120,7 @@ pub async fn decode_block(
 ///
 /// Costs one extra runtime-version lookup per block. Subxt caches metadata per spec version
 /// on the client, so the expensive part is paid once per runtime rather than once per block.
-async fn executing_runtime(
+pub(crate) async fn executing_runtime(
     client: &OnlineClient<PolkadotConfig>,
     chain: &ChainInfo,
     at: &AtBlock,
@@ -225,6 +236,117 @@ pub async fn decode_at(
         runtime.extrinsics().from_bytes(body).await
     };
 
+    decode_core(
+        BlockParts {
+            number,
+            hash: at.block_hash().0.to_vec(),
+            parent_hash: header.parent_hash.0.to_vec(),
+            state_root: header.state_root.0.to_vec(),
+            extrinsics_root: header.extrinsics_root.0.to_vec(),
+            spec_version,
+            events,
+            extrinsics,
+        },
+        chain,
+    )
+}
+
+/// Decode a block that was archived, using only archived bytes and archived metadata.
+///
+/// The mirror image of [`decode_at`], sharing all of its field-shaping code: `at` here is an
+/// *offline* client at the block, built from the metadata the archive holds for the runtime
+/// that executed it. No network is touched, and none is available to fall back on — which is
+/// the point.
+///
+/// `async` despite touching nothing remote, because `ExtrinsicsClient::from_bytes` is. A
+/// wart, not a cost.
+pub async fn decode_stored<C>(
+    at: &ClientAtBlock<PolkadotConfig, C>,
+    raw: &RawBlock,
+    chain: &ChainInfo,
+) -> Result<BlockData>
+where
+    C: OfflineClientAtBlockT<PolkadotConfig>,
+{
+    let number = raw.number;
+
+    let header =
+        Header::decode(&mut &raw.header[..]).map_err(|source| ChainError::ArchiveCorrupt {
+            chain: chain.id.clone(),
+            number,
+            reason: format!("the archived header does not decode: {source}"),
+        })?;
+
+    // The stored hash is re-derivable — decode the header, re-encode it, hash it — so this
+    // is 32 bytes of insurance rather than a correction of a known defect. What it buys is
+    // that a silent round-trip failure surfaces *here*, naming the block, instead of as a
+    // fabricated `ChainLinkageBroken` one block later.
+    let rederived = at.hasher().hash(&header.encode());
+    if rederived.0.as_slice() != raw.hash.as_slice() {
+        return Err(ChainError::ArchiveCorrupt {
+            chain: chain.id.clone(),
+            number,
+            reason: format!(
+                "the archived header hashes to 0x{}, but the record says 0x{}",
+                hex::encode(rederived.0),
+                hex::encode(raw.hash)
+            ),
+        });
+    }
+
+    let events = at.events().from_bytes(raw.events.clone());
+    let extrinsics = at.extrinsics().from_bytes(raw.extrinsics.clone()).await;
+
+    decode_core(
+        BlockParts {
+            number,
+            hash: raw.hash.to_vec(),
+            parent_hash: header.parent_hash.0.to_vec(),
+            state_root: header.state_root.0.to_vec(),
+            extrinsics_root: header.extrinsics_root.0.to_vec(),
+            spec_version: raw.spec_version,
+            events,
+            extrinsics,
+        },
+        chain,
+    )
+}
+
+/// A block reduced to the primitives every stored row is a pure function of.
+struct BlockParts<'a, C: Clone> {
+    number: u64,
+    hash: Vec<u8>,
+    parent_hash: Vec<u8>,
+    state_root: Vec<u8>,
+    extrinsics_root: Vec<u8>,
+    /// The runtime that **executed** the block, not the one the node reports for it.
+    spec_version: u32,
+    events: Events<PolkadotConfig>,
+    extrinsics: Extrinsics<'a, PolkadotConfig, C>,
+}
+
+/// Shape one block's rows out of already-materialised events and extrinsics.
+///
+/// Generic over the client because `OnlineClientAtBlockT<T>: OfflineClientAtBlockT<T>` — the
+/// online trait is a *subtype* of the offline one, so this single body serves both the live
+/// pipeline and a fully offline replay. Anything that decodes differently between the two
+/// paths is a bug the archive would preserve forever, which is why there is one body rather
+/// than two that look alike.
+fn decode_core<C>(parts: BlockParts<'_, C>, chain: &ChainInfo) -> Result<BlockData>
+where
+    C: OfflineClientAtBlockT<PolkadotConfig>,
+{
+    let BlockParts {
+        number,
+        hash,
+        parent_hash,
+        state_root,
+        extrinsics_root,
+        spec_version,
+        events,
+        extrinsics,
+    } = parts;
+
     // Decode events first: they carry the per-extrinsic outcome and fee, which the
     // extrinsic rows need.
     let mut new_events = Vec::with_capacity(events.len() as usize);
@@ -331,10 +453,10 @@ pub async fn decode_at(
         block: NewBlock {
             chain_id: chain.id.clone(),
             number: number as i64,
-            hash: at.block_hash().0.to_vec(),
-            parent_hash: header.parent_hash.0.to_vec(),
-            state_root: header.state_root.0.to_vec(),
-            extrinsics_root: header.extrinsics_root.0.to_vec(),
+            hash,
+            parent_hash,
+            state_root,
+            extrinsics_root,
             spec_version: spec_version as i32,
             timestamp,
             extrinsic_count: new_extrinsics.len() as i32,

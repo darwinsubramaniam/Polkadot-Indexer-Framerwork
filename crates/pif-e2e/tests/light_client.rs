@@ -91,6 +91,7 @@ fn a_light_client_chain_refuses_a_start_block() {
     let config = ChainConfig::light_client("polkadot-lc", "specs/polkadot.json").from_block(100);
     let indexer = pif_core::IndexerConfig {
         chains: vec![config],
+        pipeline: pif_core::PipelineConfig::default(),
     };
 
     let err = indexer.validate().unwrap_err();

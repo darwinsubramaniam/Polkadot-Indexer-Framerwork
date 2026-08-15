@@ -14,6 +14,7 @@ license = "Apache-2.0"
 pif-core = { path = "crates/pif-core", package = "polkadot-indexer-core", version = "1.0.0" }
 pif-db = { path = "crates/pif-db", package = "polkadot-indexer-db", version = "1.0.0" }
 pif-chain = { path = "crates/pif-chain", package = "polkadot-indexer-chain", version = "1.0.0" }
+pif-store = { path = "crates/pif-store", package = "polkadot-indexer-store", version = "1.0.0" }
 pif-api = { path = "crates/pif-api", package = "polkadot-indexer-api", version = "1.0.0" }
 pif-identity = { path = "crates/pif-identity", package = "polkadot-indexer-identity", version = "1.0.0" }
 # Reference handler. Unpublished — downstream projects copy it rather than depend on it.
@@ -37,6 +38,14 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "json",
 ] }
 bigdecimal = "0.4"
+# The block archive. zstd per block (not per file) is what keeps random access possible;
+# crc32 per frame is what makes bit rot an error rather than a mis-decode.
+zstd = "0.13"
+crc32fast = "1.5"
+# Content hash for archived runtime metadata: detects a spec version served two different
+# ways, and bit rot in an artifact that is kept forever.
+sha2 = "0.10"
+tempfile = "3.15"
 
 # --- api ---
 async-graphql = { version = "7.2.1", features = ["dataloader", "chrono"] }

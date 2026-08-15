@@ -75,6 +75,31 @@ index-to TO:
 index-light *ARGS:
     cargo run -p polkadot-indexer-cli {{ALL}},light-client -- index {{ARGS}}
 
+# ---------------------------------------------------------------- the block archive
+#
+# `index` runs both stages together and is still the normal way to run the indexer. These
+# split it, which is useful when the two need to move independently — archiving through a
+# runtime the digest cannot read yet, or re-processing without re-downloading.
+
+# Archive blocks locally without processing them. Decodes nothing.
+fetch *ARGS:
+    cargo run -p polkadot-indexer-cli {{ALL}} -- fetch {{ARGS}}
+
+# Process blocks that are already archived. Needs no node unless a handler reads state.
+digest *ARGS:
+    cargo run -p polkadot-indexer-cli {{ALL}} -- digest {{ARGS}}
+
+# Re-process a range from the archive, e.g. `just replay 0 1000`.
+#
+# This is what the archive is for: adding a handler or fixing a decode bug costs a
+# re-digest, not a re-download.
+replay FROM TO:
+    cargo run -p polkadot-indexer-cli {{ALL}} -- replay --from {{FROM}} --to {{TO}}
+
+# What the archive holds, and how far each stage has got.
+store-status *ARGS:
+    cargo run -p polkadot-indexer-cli {{ALL}} -- store status {{ARGS}}
+
 # Serve the GraphQL API (GraphiQL on http://localhost:8000).
 serve *ARGS:
     cargo run -p polkadot-indexer-cli {{ALL}} -- serve {{ARGS}}
@@ -136,6 +161,15 @@ test-upgrade-boundary:
 # The offline-decode spike (IPD-002 §9.1.1). Runs against any chain; 9944 by default.
 test-offline-decode:
     cargo test -p pif-e2e --test decode_stored_spike -- --ignored --nocapture
+
+# The pipeline split end to end (IPD-002 phase 1). Needs `just up`.
+#
+# The test that matters most is `the_split_pipeline_writes_the_same_rows`: the archive is
+# worth nothing if the blocks it yields differ from the ones the network yielded. The one
+# that matters second replays against a dead address, so a replay that quietly became a
+# re-download would fail rather than pass slowly.
+test-pipeline-split: up
+    cargo test -p pif-e2e --test pipeline_split -- --ignored --nocapture --test-threads=1
 
 # The alias cross-check end to end: transfers on the hub, identities on People, one join.
 zn-alias-demo:

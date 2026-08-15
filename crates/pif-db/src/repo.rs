@@ -9,7 +9,7 @@
 use pif_core::ChainInfo;
 use sqlx::{PgConnection, PgPool};
 
-use crate::models::{BlockData, Cursor, NewEvent, NewExtrinsic};
+use crate::models::{ArchivedRuntime, BlockData, Cursor, NewEvent, NewExtrinsic, Watermarks};
 
 pub type DbResult<T> = Result<T, sqlx::Error>;
 
@@ -225,6 +225,239 @@ async fn insert_event(tx: &mut PgConnection, event: &NewEvent) -> DbResult<()> {
     .await?;
 
     Ok(())
+}
+
+/// Read a chain's discovered identity back out of the database.
+///
+/// This is what makes a genuinely offline replay possible: everything `decode` needs about a
+/// chain — its id and SS58 prefix — was recorded the first time it was indexed, so replaying
+/// from the archive needs no node to ask.
+pub async fn load_chain(pool: &PgPool, chain_id: &str) -> DbResult<Option<ChainInfo>> {
+    /// `chains`, in column order.
+    type ChainRow = (String, Vec<u8>, String, Option<String>, Option<i16>, i32);
+
+    let row: Option<ChainRow> = sqlx::query_as(
+        r#"
+        SELECT id, genesis_hash, name, token_symbol, token_decimals, ss58_prefix
+        FROM chains WHERE id = $1
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(
+        |(id, genesis_hash, name, token_symbol, token_decimals, ss58_prefix)| ChainInfo {
+            id,
+            genesis_hash,
+            name,
+            token_symbol,
+            token_decimals: token_decimals.and_then(|d| u8::try_from(d).ok()),
+            ss58_prefix: u16::try_from(ss58_prefix).unwrap_or(pif_core::ss58::DEFAULT_PREFIX),
+        },
+    ))
+}
+
+/// The runtime name of the most recent runtime this chain has indexed.
+///
+/// Read back rather than asked of a node, so a replay can fill in `blocks.spec_name` with
+/// the node switched off. The name is stable across a chain's life — Polkadot has never
+/// stopped being "polkadot" — so the newest row is a safe answer for older blocks too.
+pub async fn latest_spec_name(pool: &PgPool, chain_id: &str) -> DbResult<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        r#"
+        SELECT spec_name FROM runtime_versions
+        WHERE chain_id = $1
+        ORDER BY spec_version DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| r.0))
+}
+
+/// Read how far each pipeline stage has got.
+pub async fn load_watermarks(pool: &PgPool, chain_id: &str) -> DbResult<Option<Watermarks>> {
+    let row: Option<(i64, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT fetch_watermark, digest_watermark, archive_watermark
+        FROM pipeline_watermarks WHERE chain_id = $1
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(fetch, digest, archive)| Watermarks {
+        fetch,
+        digest,
+        archive,
+    }))
+}
+
+/// Create a chain's watermark row if it has none, seeded at `at`.
+///
+/// A no-op once the row exists — a restart must never move a watermark backwards, and the
+/// `0002_pipeline` migration has already seeded rows for chains indexed before the archive.
+///
+/// `at` is the block *before* the first one to index, so a chain starting at genesis seeds
+/// at `-1`: nothing has been done yet, and `0` would mean block 0 was already indexed.
+/// `LEAST(0, $2)` keeps the archive watermark below it so the table's ordering check holds
+/// at that boundary.
+pub async fn init_watermarks(pool: &PgPool, chain_id: &str, at: i64) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO pipeline_watermarks
+            (chain_id, fetch_watermark, digest_watermark, archive_watermark)
+        VALUES ($1, $2, $2, LEAST(0, $2))
+        ON CONFLICT (chain_id) DO NOTHING
+        "#,
+    )
+    .bind(chain_id)
+    .bind(at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Move a chain's watermarks *back* to `to`, so a range is fetched and digested again.
+///
+/// The one place the monotonicity rule is broken on purpose: `--from` and `pif replay` are
+/// explicit requests to redo work. `archive_watermark` is clamped rather than reset, because
+/// blocks already tiered to cold storage are still there — and the table's ordering check
+/// would reject a digest watermark below it.
+pub async fn reset_watermarks(pool: &PgPool, chain_id: &str, to: i64) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO pipeline_watermarks
+            (chain_id, fetch_watermark, digest_watermark, archive_watermark)
+        VALUES ($1, $2, $2, LEAST(0, $2))
+        ON CONFLICT (chain_id) DO UPDATE SET
+            fetch_watermark   = $2,
+            digest_watermark  = $2,
+            archive_watermark = LEAST(pipeline_watermarks.archive_watermark, $2),
+            updated_at        = now()
+        "#,
+    )
+    .bind(chain_id)
+    .bind(to)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Record that every block up to `to` is archived and durable.
+///
+/// Called only *after* the store has been synced, so the watermark can never claim a block
+/// the disk does not hold. `GREATEST` keeps it monotonic even if a re-fetch replays ground
+/// the store already covers.
+pub async fn advance_fetch_watermark(pool: &PgPool, chain_id: &str, to: i64) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE pipeline_watermarks
+        SET fetch_watermark = GREATEST(fetch_watermark, $2), updated_at = now()
+        WHERE chain_id = $1
+        "#,
+    )
+    .bind(chain_id)
+    .bind(to)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Record that every block up to `to` is committed to Postgres, without committing.
+///
+/// Takes a connection rather than a pool because it belongs *inside* the block's
+/// transaction, next to the cursor update: the watermark must never be ahead of the rows it
+/// claims to describe, and the only way to guarantee that is to commit them together.
+pub async fn advance_digest_watermark(
+    tx: &mut PgConnection,
+    chain_id: &str,
+    to: i64,
+) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE pipeline_watermarks
+        SET digest_watermark = GREATEST(digest_watermark, $2), updated_at = now()
+        WHERE chain_id = $1
+        "#,
+    )
+    .bind(chain_id)
+    .bind(to)
+    .execute(&mut *tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Record that a runtime's metadata is in the archive.
+///
+/// Extends the `runtime_versions` row rather than writing to a table of its own. That table
+/// already has this exact grain — one row per `(chain_id, spec_version)` — and two tables at
+/// the same grain would have to agree about which block a runtime started at. The day they
+/// disagreed, the archive would be the one that was wrong.
+///
+/// `first_seen_block` is written on insert and never updated: the ingest path already gets
+/// it right, and an upgrade block re-asserting the *previous* runtime's row must not drag
+/// that row's first block forward.
+pub async fn record_archived_runtime(
+    pool: &PgPool,
+    chain_id: &str,
+    runtime: &ArchivedRuntime,
+) -> DbResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO runtime_versions (
+            chain_id, spec_version, spec_name, first_seen_block,
+            transaction_version, metadata_version, metadata_hash, metadata_archived_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+        ON CONFLICT (chain_id, spec_version) DO UPDATE SET
+            transaction_version  = EXCLUDED.transaction_version,
+            metadata_version     = EXCLUDED.metadata_version,
+            metadata_hash        = EXCLUDED.metadata_hash,
+            metadata_archived_at = EXCLUDED.metadata_archived_at
+        "#,
+    )
+    .bind(chain_id)
+    .bind(runtime.spec_version)
+    .bind(&runtime.spec_name)
+    .bind(runtime.first_seen_block)
+    .bind(runtime.transaction_version)
+    .bind(runtime.metadata_version)
+    .bind(&runtime.metadata_hash)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Runtimes this chain has indexed but whose metadata is not in the archive.
+///
+/// The precise answer to "which ranges can I actually replay?". Every row written before the
+/// archive existed is in here, which is a fact worth being able to query rather than a gap
+/// to be embarrassed about.
+pub async fn runtimes_without_metadata(pool: &PgPool, chain_id: &str) -> DbResult<Vec<(i32, i64)>> {
+    let rows: Vec<(i32, i64)> = sqlx::query_as(
+        r#"
+        SELECT spec_version, first_seen_block
+        FROM runtime_versions
+        WHERE chain_id = $1 AND metadata_hash IS NULL
+        ORDER BY first_seen_block
+        "#,
+    )
+    .bind(chain_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
 }
 
 /// Highest block stored for a chain. Used by tests and by `indexerStatus`.

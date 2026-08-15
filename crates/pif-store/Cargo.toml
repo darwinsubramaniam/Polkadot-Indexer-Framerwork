@@ -1,0 +1,29 @@
+[package]
+name = "polkadot-indexer-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local block archive for the Polkadot Indexer Framework: segment files, runtime metadata, and cold tiering"
+repository = "https://github.com/darwinsubramaniam/polkadot-indexer-framework"
+homepage = "https://github.com/darwinsubramaniam/polkadot-indexer-framework"
+readme = "../../README.md"
+keywords = ["polkadot", "substrate", "indexer", "blockchain", "archive"]
+categories = ["database", "command-line-utilities"]
+
+[lib]
+# Short import name: `use pif_store::…`.
+name = "pif_store"
+
+# Deliberately no subxt, no sqlx, no pif-chain. This crate owns bytes on disk and nothing
+# else — see IPD-002 §11.1.1 for why that is a compile requirement rather than a preference:
+# `StorageAt` lives in pif-chain and pif-chain needs `RawBlock`, so a decorator here would
+# close a dependency cycle.
+[dependencies]
+parity-scale-codec = { workspace = true, features = ["derive"] }
+zstd.workspace = true
+crc32fast.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

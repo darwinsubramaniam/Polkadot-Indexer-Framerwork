@@ -49,6 +49,72 @@ enum Command {
         to: Option<u64>,
     },
 
+    /// Archive blocks locally without processing them.
+    ///
+    /// Decodes nothing, so it keeps running through a runtime the digest cannot yet read —
+    /// and the backlog is waiting when a fix lands.
+    Fetch {
+        #[arg(long, env = "INDEXER_CONFIG", default_value = "config/chains.toml")]
+        config: PathBuf,
+
+        /// Archive only this chain id, instead of every configured chain.
+        #[arg(long)]
+        chain: Option<String>,
+
+        /// Ignore the stored watermarks and start from this block.
+        #[arg(long)]
+        from: Option<u64>,
+
+        /// Stop once this block has been archived, instead of following the head.
+        #[arg(long)]
+        to: Option<u64>,
+    },
+
+    /// Process blocks that are already archived.
+    ///
+    /// Connects to the chain only if a configured handler reads chain state; otherwise this
+    /// runs with the node switched off.
+    Digest {
+        #[arg(long, env = "INDEXER_CONFIG", default_value = "config/chains.toml")]
+        config: PathBuf,
+
+        #[arg(long)]
+        chain: Option<String>,
+
+        /// Re-digest from this block, moving the digest watermark back to reach it.
+        #[arg(long)]
+        from: Option<u64>,
+
+        #[arg(long)]
+        to: Option<u64>,
+    },
+
+    /// Re-process a range from the local archive.
+    ///
+    /// The reason the archive exists: adding a handler or fixing a decode bug becomes a local
+    /// operation over bytes already held, rather than a re-download. Every insert is
+    /// `ON CONFLICT DO NOTHING`, so replaying an indexed range is idempotent.
+    Replay {
+        #[arg(long, env = "INDEXER_CONFIG", default_value = "config/chains.toml")]
+        config: PathBuf,
+
+        /// Replay only this chain id.
+        #[arg(long)]
+        chain: Option<String>,
+
+        #[arg(long)]
+        from: u64,
+
+        #[arg(long)]
+        to: u64,
+    },
+
+    /// Inspect the local block archive.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
+
     /// Serve the GraphQL API. Requires building with `--features api`.
     ///
     /// The subcommand is always present, even when the feature is off, so that running it
@@ -57,6 +123,18 @@ enum Command {
     Serve {
         #[arg(long, env = "API_PORT", default_value_t = 8000)]
         port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// What the archive holds, and how far each stage has got.
+    Status {
+        #[arg(long, env = "INDEXER_CONFIG", default_value = "config/chains.toml")]
+        config: PathBuf,
+
+        #[arg(long)]
+        chain: Option<String>,
     },
 }
 
@@ -98,16 +176,7 @@ async fn main() -> Result<()> {
             to,
         } => {
             let config = IndexerConfig::from_path(&config)?;
-
-            let selected: Vec<_> = match &chain {
-                Some(id) => vec![
-                    config
-                        .chain(id)
-                        .with_context(|| format!("no chain {id:?} in config"))?
-                        .clone(),
-                ],
-                None => config.chains.clone(),
-            };
+            let selected = select_chains(&config, chain.as_deref())?;
 
             tracing::info!(chains = selected.len(), "starting indexer");
 
@@ -132,6 +201,68 @@ async fn main() -> Result<()> {
 
             while let Some(result) = tasks.join_next().await {
                 result.context("indexer task panicked")??;
+            }
+        }
+
+        Command::Fetch {
+            config,
+            chain,
+            from,
+            to,
+        } => {
+            let config = IndexerConfig::from_path(&config)?;
+            let selected = select_chains(&config, chain.as_deref())?;
+
+            tracing::info!(chains = selected.len(), "starting fetch stage");
+            run_per_chain(&pool, selected, move |pool, chain_config| async move {
+                let options = pif_chain::IndexOptions { stop_at: to, from };
+                pif_chain::fetch_only(&pool, &chain_config, options).await
+            })
+            .await?;
+        }
+
+        Command::Digest {
+            config,
+            chain,
+            from,
+            to,
+        } => {
+            let config = IndexerConfig::from_path(&config)?;
+            let selected = select_chains(&config, chain.as_deref())?;
+
+            tracing::info!(chains = selected.len(), "starting digest stage");
+            run_per_chain(&pool, selected, move |pool, chain_config| async move {
+                let options = pif_chain::IndexOptions { stop_at: to, from };
+                let registry = build_registry();
+                pif_chain::digest_only(&pool, &chain_config, &registry, options).await
+            })
+            .await?;
+        }
+
+        Command::Replay {
+            config,
+            chain,
+            from,
+            to,
+        } => {
+            let config = IndexerConfig::from_path(&config)?;
+            let selected = select_chains(&config, chain.as_deref())?;
+
+            run_per_chain(&pool, selected, move |pool, chain_config| async move {
+                let registry = build_registry();
+                pif_chain::replay(&pool, &chain_config, &registry, from, to).await
+            })
+            .await?;
+            tracing::info!(from, to, "replay complete");
+        }
+
+        Command::Store {
+            command: StoreCommand::Status { config, chain },
+        } => {
+            let config = IndexerConfig::from_path(&config)?;
+            for chain_config in select_chains(&config, chain.as_deref())? {
+                let status = pif_chain::store_status(&pool, &chain_config).await?;
+                print_store_status(&status);
             }
         }
 
@@ -161,6 +292,113 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The chains a subcommand should act on: one named chain, or every configured one.
+fn select_chains(
+    config: &IndexerConfig,
+    chain: Option<&str>,
+) -> Result<Vec<pif_core::ChainConfig>> {
+    match chain {
+        Some(id) => Ok(vec![
+            config
+                .chain(id)
+                .with_context(|| format!("no chain {id:?} in config"))?
+                .clone(),
+        ]),
+        None => Ok(config.chains.clone()),
+    }
+}
+
+/// Run one task per chain, so a chain that goes down cannot stall the others.
+///
+/// The registry is rebuilt inside each task rather than shared, because `Selected` borrows
+/// from it and a spawned task needs everything it holds to be `'static`.
+async fn run_per_chain<F, Fut>(
+    pool: &sqlx::PgPool,
+    chains: Vec<pif_core::ChainConfig>,
+    work: F,
+) -> Result<()>
+where
+    F: Fn(sqlx::PgPool, pif_core::ChainConfig) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = pif_chain::Result<()>> + Send,
+{
+    let mut tasks = tokio::task::JoinSet::new();
+    for chain_config in chains {
+        let pool = pool.clone();
+        let work = work.clone();
+        tasks.spawn(async move {
+            let id = chain_config.id.clone();
+            if let Err(e) = work(pool, chain_config).await {
+                tracing::error!(chain = %id, error = %e, "chain task stopped");
+                return Err(e);
+            }
+            Ok(())
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.context("chain task panicked")??;
+    }
+    Ok(())
+}
+
+/// Print one chain's archive status, as lines rather than a table: it is read in a terminal
+/// next to a failing replay, and the interesting number is usually the last one.
+fn print_store_status(status: &pif_chain::pipeline::StoreStatus) {
+    println!("chain            {}", status.chain_id);
+    println!("archive          {}", status.path);
+
+    match status.watermarks {
+        Some(marks) => {
+            println!("fetch watermark  {}", marks.fetch);
+            println!("digest watermark {}", marks.digest);
+            println!("archive tier     {}", marks.archive);
+            println!("digest backlog   {}", marks.fetch - marks.digest);
+        }
+        None => println!("watermarks       none — this chain has not been indexed here"),
+    }
+
+    println!("segments         {}", status.usage.segments);
+    println!("runtimes         {}", status.usage.runtimes);
+    println!("hot bytes        {}", human_bytes(status.usage.bytes));
+
+    match status.replayable {
+        Some((from, to)) => println!("replayable       {from}..={to}"),
+        None => println!("replayable       nothing is archived for this chain"),
+    }
+
+    if !status.runtimes_without_metadata.is_empty() {
+        // Expected for every range indexed before the archive existed, and the precise
+        // answer to "which ranges can I actually replay?".
+        println!("runtimes with no archived metadata (these ranges cannot be replayed):");
+        for (spec_version, first_block) in &status.runtimes_without_metadata {
+            println!("  spec {spec_version} from block {first_block}");
+        }
+    }
+
+    println!();
+}
+
+/// Size in whichever unit keeps it readable.
+///
+/// A fixed unit is wrong at both ends of this range: an archive is kilobytes on a dev chain
+/// the day it is set up, and hundreds of gigabytes on Polkadot. "0.0 MiB" answers neither
+/// question.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [(&str, f64); 4] = [
+        ("TiB", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("GiB", 1024.0 * 1024.0 * 1024.0),
+        ("MiB", 1024.0 * 1024.0),
+        ("KiB", 1024.0),
+    ];
+
+    for (unit, scale) in UNITS {
+        if bytes as f64 >= scale {
+            return format!("{:.1} {unit}", bytes as f64 / scale);
+        }
+    }
+    format!("{bytes} B")
 }
 
 /// The GraphQL schema this binary serves.
@@ -222,6 +460,17 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn archive_sizes_are_readable_at_both_ends_of_the_range() {
+        // A dev chain's archive and Polkadot's differ by nine orders of magnitude, and the
+        // status line has to be useful for both.
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(human_bytes(120 * 1024 * 1024 * 1024), "120.0 GiB");
     }
 
     #[test]

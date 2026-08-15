@@ -66,3 +66,37 @@ pub struct Cursor {
     pub last_indexed_block: i64,
     pub last_indexed_hash: Vec<u8>,
 }
+
+/// How far each stage of the pipeline has got.
+///
+/// Replaces the dual meaning of `Cursor.last_indexed_block`, which meant both "fetched" and
+/// "processed" because they were the same event. Once fetching and digesting are separate,
+/// so are the numbers — and confusing them is how a reader ends up advertising blocks whose
+/// rows do not exist yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Watermarks {
+    /// Highest *contiguous* block in the archive, never the highest present. A digest that
+    /// treated "the key exists" as "ready" would step over a hole and record a gap as
+    /// success.
+    pub fetch: i64,
+    /// Highest block committed to Postgres. This is what indexing progress means.
+    pub digest: i64,
+    /// Highest block moved to cold storage.
+    pub archive: i64,
+}
+
+/// What the archive holds for one runtime, beyond the fact that it existed.
+#[derive(Debug, Clone)]
+pub struct ArchivedRuntime {
+    pub spec_version: i32,
+    pub spec_name: String,
+    /// The first block *this indexer saw* executing this runtime. At an upgrade that is the
+    /// block after the one carrying `set_code`: the upgrade block itself was executed by the
+    /// previous runtime and belongs to its row.
+    pub first_seen_block: i64,
+    pub transaction_version: i32,
+    /// 14 | 15 | 16 — which metadata format was archived. A runtime serves several at once
+    /// and they are not interchangeable in what they describe.
+    pub metadata_version: i16,
+    pub metadata_hash: Vec<u8>,
+}

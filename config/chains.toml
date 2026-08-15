@@ -24,6 +24,28 @@
 # answer), so it only ever follows the finalized head forward from the moment it starts.
 # Requires building with `--features light-client`.
 
+# --------------------------------------------------------------------------------------
+# The block archive
+# --------------------------------------------------------------------------------------
+#
+# Fetching and processing are two separate stages, with raw blocks on local disk between
+# them. That is what makes a re-index cost a re-*digest* rather than a re-download: adding a
+# handler, or fixing a decode bug, becomes `pif replay` over bytes already held.
+#
+# Optional. Without this table every chain archives to `.pif-store` next to the config file,
+# which is what the defaults below say. A chain can override it with its own
+# `[chains.pipeline]` table.
+#
+# Sizing, so a disk can be bought before it is needed: Polkadot is ~28M blocks at roughly
+# 5-15 KB raw per block with events, so 200-400 GB uncompressed and 60-120 GB with zstd.
+#
+# [pipeline]
+# hot_path = "/mnt/ssd/pif"
+# # Blocks per segment file. Segments are aligned, so a block's file is computed from its
+# # number rather than looked up -- which means changing this on an existing store makes
+# # everything already written unfindable. Choose it once.
+# segment_size = 1000
+
 [[chains]]
 # Stable key. Becomes the primary key in every table, so don't rename it casually.
 id = "dev-local"

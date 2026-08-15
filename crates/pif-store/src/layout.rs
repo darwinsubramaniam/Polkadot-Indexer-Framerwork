@@ -1,0 +1,132 @@
+//! Where a block lives on disk — computed, never looked up.
+//!
+//! Segments are fixed-size and aligned, so `segment_index = number / segment_size` resolves
+//! a block to a file with no database round-trip at all. That is why `segments` in Postgres
+//! records tier and checksum but not a path: a location that is *derived* cannot drift out
+//! of sync with a table recording where it was supposed to be.
+
+use std::path::{Path, PathBuf};
+
+use crate::error::{Result, StoreError};
+
+/// Blocks per segment file.
+///
+/// One file per block would be 28M inodes on Polkadot; one file for everything gives up
+/// random access. A thousand blocks keeps tiering a **file copy** rather than a range
+/// scan-and-delete, and keeps replay a **sequential** read — the difference between usable
+/// and unusable on an HDD.
+pub const DEFAULT_SEGMENT_SIZE: u64 = 1000;
+
+/// Which segment holds this block.
+pub fn segment_index(number: u64, segment_size: u64) -> u64 {
+    number / segment_size
+}
+
+/// First block number a segment covers.
+pub fn segment_start(index: u64, segment_size: u64) -> u64 {
+    index * segment_size
+}
+
+/// Last block number a segment covers, inclusive.
+pub fn segment_end(index: u64, segment_size: u64) -> u64 {
+    segment_start(index, segment_size) + segment_size - 1
+}
+
+/// `<root>/<chain_id>/blocks`
+pub fn blocks_dir(root: &Path, chain: &str) -> Result<PathBuf> {
+    Ok(chain_dir(root, chain)?.join("blocks"))
+}
+
+/// `<root>/<chain_id>/meta`
+pub fn meta_dir(root: &Path, chain: &str) -> Result<PathBuf> {
+    Ok(chain_dir(root, chain)?.join("meta"))
+}
+
+/// `<root>/<chain_id>/meta/<spec_version>.scale`
+pub fn metadata_path(root: &Path, chain: &str, spec_version: u32) -> Result<PathBuf> {
+    Ok(meta_dir(root, chain)?.join(format!("{spec_version}.scale")))
+}
+
+/// The `.seg` and `.idx` pair for one segment.
+pub fn segment_paths(
+    root: &Path,
+    chain: &str,
+    index: u64,
+    segment_size: u64,
+) -> Result<(PathBuf, PathBuf)> {
+    let dir = blocks_dir(root, chain)?;
+    let stem = segment_stem(index, segment_size);
+    Ok((
+        dir.join(format!("{stem}.seg")),
+        dir.join(format!("{stem}.idx")),
+    ))
+}
+
+/// `000012800-000013799` — zero-padded so an `ls` sorts in block order.
+pub fn segment_stem(index: u64, segment_size: u64) -> String {
+    format!(
+        "{:09}-{:09}",
+        segment_start(index, segment_size),
+        segment_end(index, segment_size)
+    )
+}
+
+fn chain_dir(root: &Path, chain: &str) -> Result<PathBuf> {
+    check_chain_id(chain)?;
+    Ok(root.join(chain))
+}
+
+/// Refuse a chain id that would escape the store root.
+pub fn check_chain_id(chain: &str) -> Result<()> {
+    let ok = !chain.is_empty()
+        && chain != "."
+        && chain != ".."
+        && chain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+
+    if ok {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidChainId(chain.to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_block_resolves_to_a_file_without_a_lookup() {
+        assert_eq!(segment_index(0, 1000), 0);
+        assert_eq!(segment_index(999, 1000), 0);
+        assert_eq!(segment_index(1000, 1000), 1);
+        assert_eq!(segment_index(12_800, 1000), 12);
+    }
+
+    #[test]
+    fn segment_bounds_are_inclusive_and_aligned() {
+        assert_eq!(segment_start(12, 1000), 12_000);
+        assert_eq!(segment_end(12, 1000), 12_999);
+        assert_eq!(segment_stem(12, 1000), "000012000-000012999");
+    }
+
+    #[test]
+    fn every_block_in_a_segment_maps_back_to_it() {
+        for number in 0..3_000u64 {
+            let index = segment_index(number, 500);
+            assert!(number >= segment_start(index, 500));
+            assert!(number <= segment_end(index, 500));
+        }
+    }
+
+    #[test]
+    fn a_chain_id_cannot_escape_the_store_root() {
+        assert!(check_chain_id("polkadot").is_ok());
+        assert!(check_chain_id("asset-hub_2.0").is_ok());
+        assert!(check_chain_id("../../etc").is_err());
+        assert!(check_chain_id("..").is_err());
+        assert!(check_chain_id("a/b").is_err());
+        assert!(check_chain_id("").is_err());
+    }
+}

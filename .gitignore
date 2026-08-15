@@ -7,6 +7,11 @@
 # Spawned network state from `just zn-up`.
 /.zombienet/
 
+# The local block archive. Unanchored on purpose: `hot_path` resolves against the config
+# file, so the default lands beside whichever config was used. Tens of gigabytes on a real
+# chain, and re-fetchable — it is a cache of what the chain already holds.
+.pif-store/
+
 # Local environment overrides
 .env
 

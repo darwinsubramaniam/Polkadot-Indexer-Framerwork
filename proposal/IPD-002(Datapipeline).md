@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed |
+| **Status** | Phases 0, 0.5 and 1 shipped; 2–5 proposed |
 | **Author** | Darwin Subramaniam |
 | **Created** | 2026-08-15 |
 | **Target** | Every chain reached over RPC (`ChainSource::Rpc`) |
@@ -1317,7 +1317,7 @@ parses in tests and fails in the field.
 | `src/config.rs:36` | `ChainSource::Rpc` gains `endpoints: Vec<Endpoint>` alongside `url`. |
 | `src/config.rs:172-200` | `TryFrom<RawChainConfig>` resolves the source from *three* spellings instead of two: `ws_url`, `[chains.source]` with `url`, and `[chains.source]` with `endpoints`. The existing "set either, not both" error (`config.rs:177-183`) extends to the new pair. |
 | `src/config.rs:156` | `RawChainConfig` gains `pipeline: Option<PipelineConfig>`. |
-| `src/config.rs` | New `PipelineConfig` (`hot_path`, `cold_path`, `chunk_size`, `retention`, `on_digest`, `max_digest_lag`), optional per chain, with a global default on `IndexerConfig` — which has no `deny_unknown_fields`, so a new top-level table is backwards compatible. |
+| `src/config.rs` | New `PipelineConfig` (`hot_path`, `cold_path`, `chunk_size`, `retention`, `on_digest`, `max_digest_lag`), optional per chain, with a global default on `IndexerConfig` — which has no `deny_unknown_fields`, so a new top-level table is backwards compatible. **Phase 1 ships only the fields it honours** — `hot_path` and `segment_size` — rather than declaring the whole table up front: a knob that parses and does nothing is worse than an absent one, because it reads as configured behaviour. The rest arrive with the phases that act on them, and `IndexerConfig`'s missing `deny_unknown_fields` is exactly what makes adding them later a non-event. |
 | `src/config.rs:226` | `resolve_paths` resolves `hot_path`/`cold_path` relative to the config file, as it already does for chain specs — but checks `is_dir()` and **must not require pre-existence**, since the store is created on first run. |
 | `src/config.rs:261` | `validate()` gains: reject an empty `endpoints` list; apply the existing `ws://`/`wss://` check (`config.rs:286-293`) to *every* endpoint; reject `cold_path == hot_path`; reject an explicit `max_digest_lag > 256` when no endpoint declares `archive`. |
 
@@ -1388,7 +1388,7 @@ a coherent system.
 |---|---|---|
 | **0 — Spike** *(done)* | `tests/decode_stored_spike.rs`, `tests/upgrade_boundary.rs`, `tests/common/offline.rs`, `networks/upgrade-boundary.toml`, `scripts/fetch-westend-runtime.sh` | The offline-decode assumption is verified, not assumed (§9.1.1), and the upgrade boundary is verified too (§9.1.2). Both kept as permanent guards. |
 | **0.5 — Upgrade-block fix** *(done — `543a56f`)* | `decode_at` resolves metadata at the block's parent; `UpgradeBlockBodyUnavailable`; the regression test in `upgrade_boundary.rs` | **Closed a live defect that halted any chain on runtime upgrade** (§9.1.2). Shipped alone, needing none of the rest of this proposal. |
-| **1 — Hot store + split** | `pif-store` (segment + metadata), watermark tables, `fetch`/`digest` as two tasks, single endpoint, unbatched writes, the `decode_at` generic-core refactor (§11.3), connection reuse + metadata cache (§9.1) | Blocks are archived. `pif replay` works for the *dynamic core*. Handlers that read storage still hit the network. |
+| **1 — Hot store + split** *(done)* | `pif-store` (segment + metadata), watermark tables, `fetch`/`digest` as two tasks, single endpoint, unbatched writes, the `decode_at` generic-core refactor (§11.3), connection reuse + metadata cache (§9.1), `pif fetch`/`digest`/`replay`/`store status`, `tests/pipeline_split.rs` | Blocks are archived. `pif replay` works for the *dynamic core* — verified against a dead address. Handlers that read storage still hit the network, and say so by name (`StorageNotArchived`) rather than reaching for it silently. |
 | **2 — Storage read cache** | `CachedStorage`, the max-lag brake, `StorageNotArchived` | **Replay is fully offline, including `pif-identity`.** This is the phase that makes phase 1 mean what it claims. |
 | **3 — Multi-endpoint** | `EndpointPool`, limiter, chunk lease queue, per-endpoint genesis + capability probe, linkage verification | Backfill parallelises across endpoints and survives a 429 or a dead provider. |
 | **4 — Batched digest** | `UNNEST` inserts, K-blocks-per-transaction | The digest stops being the bottleneck phase 3 just created. |

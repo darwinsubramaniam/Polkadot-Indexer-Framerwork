@@ -164,26 +164,26 @@ async fn a_range_spanning_a_runtime_upgrade_decodes_offline() -> anyhow::Result<
     // authoring never returns, so this is best-effort: the boundary itself is already
     // covered by the pre-upgrade transfer and by the `sudo` extrinsic in the upgrade block.
     let api = OnlineClient::<PolkadotConfig>::from_insecure_url(&url).await?;
-    let post_block = match tokio::time::timeout(
-        Duration::from_secs(45),
-        signed_traffic(&api, 2_222_222_222),
-    )
-    .await
-    {
-        Ok(Ok(number)) => {
-            println!("post-upgrade signed extrinsic in block {number}");
-            Some(number)
-        }
-        Ok(Err(error)) => {
-            println!("post-upgrade transfer rejected ({error}); continuing without it");
-            None
-        }
-        Err(_) => {
-            println!("post-upgrade transfer timed out — chain stopped authoring after the \
-                      upgrade; continuing without it");
-            None
-        }
-    };
+    let post_block =
+        match tokio::time::timeout(Duration::from_secs(45), signed_traffic(&api, 2_222_222_222))
+            .await
+        {
+            Ok(Ok(number)) => {
+                println!("post-upgrade signed extrinsic in block {number}");
+                Some(number)
+            }
+            Ok(Err(error)) => {
+                println!("post-upgrade transfer rejected ({error}); continuing without it");
+                None
+            }
+            Err(_) => {
+                println!(
+                    "post-upgrade transfer timed out — chain stopped authoring after the \
+                      upgrade; continuing without it"
+                );
+                None
+            }
+        };
 
     // The *finalized* head, not the best block: everything archived below must be final, and
     // on a stalled chain the best block can sit ahead of finality indefinitely.

@@ -57,6 +57,61 @@ pub trait StorageAt: Send + Sync {
     ) -> Result<BoxStream<'s, Result<(Vec<u8>, Json)>>>;
 }
 
+/// [`StorageAt`] with no node behind it.
+///
+/// Used when the digest runs against the archive alone — `pif replay` against a chain whose
+/// handlers read state, or `pif digest` with no endpoint configured. Every read is a loud
+/// error rather than a silent fall-back to the network, because a replay that quietly
+/// becomes a re-download is exactly the failure the archive exists to prevent, and nobody
+/// notices until the bill arrives.
+///
+/// This is the seam the storage read cache slots into: the same decorator position, with a
+/// local cache answering the reads instead of nothing answering them.
+pub struct OfflineStorage<'a> {
+    chain_id: &'a str,
+    block: u64,
+}
+
+impl<'a> OfflineStorage<'a> {
+    pub fn new(chain_id: &'a str, block: u64) -> Self {
+        Self { chain_id, block }
+    }
+
+    fn not_archived(&self, pallet: &str, entry: &str) -> ChainError {
+        ChainError::StorageNotArchived {
+            chain: self.chain_id.to_owned(),
+            number: self.block,
+            pallet: pallet.to_owned(),
+            entry: entry.to_owned(),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageAt for OfflineStorage<'_> {
+    fn block_number(&self) -> u64 {
+        self.block
+    }
+
+    /// Reported as present, so a handler asks and gets the precise error from `fetch` rather
+    /// than concluding the chain does not have the pallet and skipping the block silently.
+    fn has_pallet(&self, _pallet: &str) -> bool {
+        true
+    }
+
+    async fn fetch(&self, pallet: &str, entry: &str, _keys: Vec<Value>) -> Result<Option<Json>> {
+        Err(self.not_archived(pallet, entry))
+    }
+
+    async fn iter<'s>(
+        &'s self,
+        pallet: String,
+        entry: String,
+    ) -> Result<BoxStream<'s, Result<(Vec<u8>, Json)>>> {
+        Err(self.not_archived(&pallet, &entry))
+    }
+}
+
 /// [`StorageAt`] backed by a live node, through subxt's dynamic storage API.
 pub struct SubxtStorage<'a> {
     at: &'a AtBlock,

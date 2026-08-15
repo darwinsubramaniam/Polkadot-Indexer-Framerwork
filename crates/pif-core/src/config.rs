@@ -13,10 +13,61 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 /// Top-level config, deserialised from `config/chains.toml`.
+///
+/// No `deny_unknown_fields` here, deliberately: it is what lets a new top-level table —
+/// `[pipeline]`, say — be added without every existing config file becoming a parse error.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IndexerConfig {
     #[serde(default)]
     pub chains: Vec<ChainConfig>,
+
+    /// Defaults for the block archive, applied to every chain that does not override them
+    /// in its own `[chains.pipeline]` table.
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+}
+
+/// Where a chain's block archive lives, and how it is laid out.
+///
+/// The archive is what makes a re-index cost a re-*digest* rather than a re-download: the
+/// fetch stage writes raw blocks here, and the digest stage reads them back instead of
+/// asking the network again.
+///
+/// Only the settings the current pipeline honours are here. The rest of IPD-002's table —
+/// `cold_path`, `retention`, `on_digest`, `max_digest_lag` — arrives with the phases that
+/// act on them, rather than sitting in the config doing nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineConfig {
+    /// Root directory for the archive. Relative paths resolve against the config file, and
+    /// the directory is created on first run rather than being required up front.
+    #[serde(default = "default_hot_path")]
+    pub hot_path: PathBuf,
+
+    /// Blocks per segment file.
+    ///
+    /// Fixed-size and aligned, so a block's file is *computed* from its number rather than
+    /// looked up. Changing this on an existing store makes previously written segments
+    /// unfindable, so it is chosen once per store, not tuned.
+    #[serde(default = "default_segment_size")]
+    pub segment_size: u64,
+}
+
+fn default_hot_path() -> PathBuf {
+    PathBuf::from(".pif-store")
+}
+
+fn default_segment_size() -> u64 {
+    1000
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            hot_path: default_hot_path(),
+            segment_size: default_segment_size(),
+        }
+    }
 }
 
 /// Where a chain's data comes from.
@@ -102,6 +153,14 @@ pub struct ChainConfig {
     /// chain it was never compiled for.
     #[serde(default)]
     pub handlers: Vec<String>,
+
+    /// This chain's block archive.
+    ///
+    /// `None` until [`IndexerConfig::from_path`] fills it in from the top-level `[pipeline]`
+    /// defaults, so a chain built by hand — `ChainConfig::rpc(…)` in a test — still has a
+    /// working archive via [`ChainConfig::pipeline`].
+    #[serde(default)]
+    pub pipeline: Option<PipelineConfig>,
 }
 
 impl ChainConfig {
@@ -112,6 +171,7 @@ impl ChainConfig {
             source: ChainSource::Rpc { url: url.into() },
             start_block: 0,
             handlers: Vec::new(),
+            pipeline: None,
         }
     }
 
@@ -126,6 +186,7 @@ impl ChainConfig {
             },
             start_block: 0,
             handlers: Vec::new(),
+            pipeline: None,
         }
     }
 
@@ -141,9 +202,24 @@ impl ChainConfig {
         self
     }
 
+    /// Archive this chain's blocks under `hot_path`.
+    pub fn with_pipeline(mut self, pipeline: PipelineConfig) -> Self {
+        self.pipeline = Some(pipeline);
+        self
+    }
+
     /// Whether this chain's transport can fetch a block by number.
     pub fn can_backfill(&self) -> bool {
         self.source.can_backfill()
+    }
+
+    /// This chain's archive settings, falling back to the defaults.
+    ///
+    /// Returned by value rather than by reference so that a chain built in code — with no
+    /// config file and therefore no `[pipeline]` table to inherit from — still archives
+    /// somewhere sensible instead of needing every caller to handle `None`.
+    pub fn pipeline(&self) -> PipelineConfig {
+        self.pipeline.clone().unwrap_or_default()
     }
 }
 
@@ -166,6 +242,13 @@ struct RawChainConfig {
     start_block: u64,
     #[serde(default)]
     handlers: Vec<String>,
+    /// Per-chain override of the top-level `[pipeline]` defaults.
+    ///
+    /// Declared *here* and not only on [`ChainConfig`]: every TOML key travels through this
+    /// struct, which denies unknown fields, so a `[chains.pipeline]` table missing from it
+    /// is a hard parse error rather than a silently ignored one.
+    #[serde(default)]
+    pipeline: Option<PipelineConfig>,
 }
 
 impl TryFrom<RawChainConfig> for ChainConfig {
@@ -195,6 +278,7 @@ impl TryFrom<RawChainConfig> for ChainConfig {
             source,
             start_block: raw.start_block,
             handlers: raw.handlers,
+            pipeline: raw.pipeline,
         })
     }
 }
@@ -223,11 +307,28 @@ impl IndexerConfig {
         Ok(config)
     }
 
-    /// Make chain-spec paths absolute against `base`, and check they exist.
+    /// Make chain-spec and archive paths absolute against `base`, and check the ones that
+    /// must already exist.
     ///
     /// Done here rather than in [`IndexerConfig::validate`] so that validation stays a pure
     /// function of the parsed config, with no filesystem in it.
     fn resolve_paths(&mut self, base: &Path) -> Result<()> {
+        // The archive's location is inherited before it is resolved, so a per-chain override
+        // and the global default are made absolute the same way.
+        for chain in &mut self.chains {
+            let mut pipeline = chain
+                .pipeline
+                .take()
+                .unwrap_or_else(|| self.pipeline.clone());
+            if pipeline.hot_path.is_relative() {
+                pipeline.hot_path = base.join(&pipeline.hot_path);
+            }
+            // Deliberately *not* checked for existence: the store is created on first run.
+            // Requiring it up front would make a fresh checkout fail to start for a reason
+            // the operator cannot act on.
+            chain.pipeline = Some(pipeline);
+        }
+
         for chain in &mut self.chains {
             let ChainSource::LightClient {
                 chain_spec,
@@ -306,6 +407,29 @@ impl IndexerConfig {
 
                 ChainSource::LightClient { .. } => {}
             }
+
+            // A zero segment size divides by zero when resolving a block to its file, and
+            // an empty root would scatter segments across the working directory.
+            if let Some(pipeline) = &chain.pipeline {
+                if pipeline.segment_size == 0 {
+                    return Err(Error::ConfigInvalid(format!(
+                        "chain {:?}: pipeline.segment_size must be greater than zero",
+                        chain.id
+                    )));
+                }
+                if pipeline.hot_path.as_os_str().is_empty() {
+                    return Err(Error::ConfigInvalid(format!(
+                        "chain {:?}: pipeline.hot_path must not be empty",
+                        chain.id
+                    )));
+                }
+            }
+        }
+
+        if self.pipeline.segment_size == 0 {
+            return Err(Error::ConfigInvalid(
+                "pipeline.segment_size must be greater than zero".into(),
+            ));
         }
 
         Ok(())
@@ -612,6 +736,124 @@ mod tests {
 
         let err = IndexerConfig::from_path(dir.join("chains.toml")).unwrap_err();
         assert!(err.to_string().contains("does not exist"), "got: {err}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_config_with_no_pipeline_table_still_has_an_archive() {
+        // Every deployment predating the archive has exactly this config. It must keep
+        // working, and it must still get somewhere to put blocks.
+        let config = parse(
+            r#"
+            [[chains]]
+            id = "dev-local"
+            ws_url = "ws://127.0.0.1:9944"
+            "#,
+        )
+        .unwrap();
+
+        let pipeline = config.chains[0].pipeline();
+        assert_eq!(pipeline.hot_path, PathBuf::from(".pif-store"));
+        assert_eq!(pipeline.segment_size, 1000);
+    }
+
+    #[test]
+    fn a_chain_overrides_the_global_pipeline_defaults() {
+        let config = parse(
+            r#"
+            [pipeline]
+            hot_path = "/mnt/ssd/pif"
+            segment_size = 4096
+
+            [[chains]]
+            id = "relay"
+            ws_url = "ws://127.0.0.1:9944"
+
+            [[chains]]
+            id = "para"
+            ws_url = "ws://127.0.0.1:9988"
+
+            [chains.pipeline]
+            hot_path = "/mnt/other/pif"
+            "#,
+        )
+        .unwrap();
+
+        // Inheritance happens in `resolve_paths`, which `parse` does not run, so the global
+        // table is read straight off the top level here.
+        assert_eq!(config.pipeline.hot_path, PathBuf::from("/mnt/ssd/pif"));
+        assert_eq!(config.pipeline.segment_size, 4096);
+        assert!(config.chain("relay").unwrap().pipeline.is_none());
+        assert_eq!(
+            config.chain("para").unwrap().pipeline().hot_path,
+            PathBuf::from("/mnt/other/pif")
+        );
+        // An override that names only one field keeps the type's defaults for the rest,
+        // rather than the global table's — worth pinning so the behaviour is a decision.
+        assert_eq!(config.chain("para").unwrap().pipeline().segment_size, 1000);
+    }
+
+    #[test]
+    fn a_misspelled_pipeline_key_is_rejected_rather_than_ignored() {
+        // `deny_unknown_fields` on the raw shape is what makes this loud; without it a typo
+        // silently archives to the default path and nobody finds out until a replay fails.
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+            ws_url = "ws://127.0.0.1:9944"
+
+            [chains.pipeline]
+            hot_paths = "/mnt/ssd/pif"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(full(&err).contains("hot_paths"), "got: {}", full(&err));
+    }
+
+    #[test]
+    fn rejects_a_segment_size_of_zero() {
+        // It divides by zero on the very first block, several layers away from here.
+        let err = parse(
+            r#"
+            [[chains]]
+            id = "dev"
+            ws_url = "ws://127.0.0.1:9944"
+
+            [chains.pipeline]
+            segment_size = 0
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("segment_size"), "got: {err}");
+    }
+
+    #[test]
+    fn resolves_the_archive_path_against_the_config_file() {
+        let dir = std::env::temp_dir().join("pif-config-pipeline-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("chains.toml"),
+            r#"
+            [pipeline]
+            hot_path = "archive"
+
+            [[chains]]
+            id = "local"
+            ws_url = "ws://127.0.0.1:9944"
+            "#,
+        )
+        .unwrap();
+
+        let config = IndexerConfig::from_path(dir.join("chains.toml")).unwrap();
+
+        // Relative to the config file, not to whatever directory `pif` was run from — and
+        // resolved even though the directory does not exist yet.
+        assert_eq!(config.chains[0].pipeline().hot_path, dir.join("archive"));
+        assert!(!dir.join("archive").exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

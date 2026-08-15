@@ -18,12 +18,58 @@ denormalised tables (`transfers`) for the queries that matter most.
 | `crates/pif-core` | `polkadot-indexer-core` | `pif_core` | config, errors, SCALE→JSON codec, SS58 |
 | `crates/pif-db` | `polkadot-indexer-db` | `pif_db` | Postgres persistence, migrations, repositories |
 | `crates/pif-chain` | `polkadot-indexer-chain` | `pif_chain` | subxt client, dynamic decoder, handler registry, pipeline |
+| `crates/pif-store` | `polkadot-indexer-store` | `pif_store` | local block archive — segment files, runtime metadata |
 | `crates/pif-api` | `polkadot-indexer-api` | `pif_api` | extensible GraphQL schema + axum server |
 | `crates/pif-identity` | `polkadot-indexer-identity` | `pif_identity` | People-chain identities, usernames and the alias cross-check |
 | `crates/pif-cli` | `polkadot-indexer-cli` | — | reference binary, `pif` |
 | `crates/example` | *(unpublished)* | — | reference handler — **copy this to start your own** |
 
-Dependency direction: `pif-cli` → {`pif-chain`, `pif-api`} → `pif-db` → `pif-core`.
+Dependency direction: `pif-cli` → {`pif-chain`, `pif-api`} → {`pif-db`, `pif-store`} →
+`pif-core`. `pif-store` depends on nothing above it — no subxt, no sqlx — because it owns
+bytes on disk and nothing else.
+
+## The data pipeline
+
+Fetching a block and processing it are two separate stages, with a local archive of raw
+blocks between them:
+
+```
+several blocks at a time          one block at a time
+   ┌──────────┐                     ┌──────────┐
+   │  fetch   │──► segment files ──►│  digest  │──► Postgres
+   └──────────┘     + metadata      └──────────┘
+        │                                 │
+   fetch_watermark ───────────────► digest_watermark
+```
+
+The payoff is not primarily speed. It is that **a re-index stops costing a re-download**:
+
+```sh
+just fetch                  # archive blocks; decodes nothing
+just digest                 # process what is archived; no node needed without handlers
+just replay 0 1000          # re-process a range from local bytes
+just store-status           # what is held, and how far each stage has got
+```
+
+`pif index` still runs both stages together and is the normal way to run the indexer.
+Nothing about an existing deployment changes: the `0002_pipeline` migration seeds the
+watermarks from the cursor already stored, so a migrated indexer resumes where it stopped
+rather than re-fetching its history.
+
+Configure where the archive lives with a `[pipeline]` table (see `config/chains.toml`); it
+defaults to `.pif-store` beside the config file. Sizing: Polkadot is ~28M blocks at roughly
+5–15 KB raw per block with events, so 200–400 GB uncompressed and 60–120 GB with zstd.
+
+> **Handlers that read chain state still need a node.** Archiving blocks makes the *dynamic
+> core* replayable. Chain **state** is not in a block — `pallet_identity` emits
+> `IdentitySet { who }` with no display name, so only storage says what it changed to — and
+> it is not archived yet. A replay of a chain with such a handler reports
+> `StorageNotArchived` rather than quietly reaching for the network. Chains with no
+> handlers, and the whole dynamic core, replay entirely offline today.
+
+> **Light-client chains are not split.** A split digest resolves each block by *number*, and
+> that is the one question smoldot refuses to answer. Those chains keep the
+> fetch-and-process-together path and do not archive yet.
 
 ## Building your own indexer on PIF
 
@@ -344,9 +390,29 @@ cannot be reverted, so there is no reorg-handling code and the stored chain can 
 an orphaned block. Anything that changes this to follow best-blocks must add rollback logic.
 
 **One Postgres transaction per block.** The block row, its extrinsics, events, typed-overlay
-rows and the resume cursor all commit together. The cursor therefore can never run ahead of
-the data it describes, which is what makes restart-resume correct rather than merely likely.
-Every insert is `ON CONFLICT DO NOTHING`, so replaying a block is a no-op.
+rows, the resume cursor and the digest watermark all commit together. No watermark can
+therefore run ahead of the data it describes, which is what makes restart-resume correct
+rather than merely likely. Every insert is `ON CONFLICT DO NOTHING`, so replaying a block is
+a no-op.
+
+**`fetch_watermark` is the highest *contiguous* block, never the highest present.** A digest
+that asked "does block N+1 exist?" would step straight over a hole and record a gap as
+success. It asks `n <= fetch_watermark` instead, and the fetch stage advances that only
+after an `fsync` — so the watermark can never claim a block the disk does not hold, and no
+reconciliation is needed on startup.
+
+**A block is decoded with the runtime that *executed* it, which is the one at its parent.**
+The block carrying `set_code` runs under the *old* runtime, but its post-state already holds
+the new `:code`, so the node reports the new version for it. Asking the node "what runtime
+is this block?" gets the one that cannot decode it. The archive stores the executing version
+per block for the same reason: recording the reported one would freeze the wrong decoder in
+permanently.
+
+**The archive keeps the richest metadata format the node offers, not the most convenient.**
+`state_getMetadata` answers V14 — the oldest format a runtime serves. V15 added runtime API
+descriptions and V16 more again, and the choice is irreversible: once the archive node that
+served a historical block is gone, the richer metadata for that runtime can never be
+obtained again.
 
 **`u128` is stored and transported as a string.** Substrate balances exceed 2^53, where JSON
 numbers silently lose precision. The codec renders `u128`/`i128` as JSON strings, Postgres
@@ -438,6 +504,8 @@ driven through the CLI rather than the SDK, and a known multi-node peering limit
 
 ## Not yet implemented
 
-Parallel historical backfill (`ArchiveBackend`), reorg handling for non-finalized tailing,
+Archiving of handler **storage reads** (so a chain with the identity handler replays offline
+too), multi-endpoint fetch with per-endpoint rate limiting, batched multi-row inserts, cold
+tiering of digested segments to a second disk, reorg handling for non-finalized tailing,
 Prometheus metrics, custom `Config` types for Ethereum-style chains (Moonbeam), XCM
 correlation across relay/parachain, and table partitioning by `chain_id`.
