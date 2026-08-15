@@ -361,7 +361,8 @@ fn print_store_status(status: &pif_chain::pipeline::StoreStatus) {
 
     println!("segments         {}", status.usage.segments);
     println!("runtimes         {}", status.usage.runtimes);
-    println!("hot bytes        {}", human_bytes(status.usage.bytes));
+    println!("block bytes      {}", human_bytes(status.usage.bytes));
+    println!("state bytes      {}", human_bytes(status.reads.bytes));
 
     match status.replayable {
         Some((from, to)) => println!("replayable       {from}..={to}"),

@@ -281,6 +281,18 @@ pub enum ChainError {
     #[error("replay range {from}..={to} is empty; --to must not be below --from")]
     EmptyReplayRange { from: u64, to: u64 },
 
+    /// A replay was asked for on a chain this database has never seen.
+    ///
+    /// A replay reads the chain's identity back out of Postgres rather than from a node —
+    /// that is what makes it offline. With no row there is nothing to decode against and
+    /// nothing archived to decode, so this stops rather than connecting to find out.
+    #[error(
+        "chain {chain} has never been indexed here, so there is nothing to replay.\n\
+         Index it first (`pif index --chain {chain}`), which archives the blocks a later \
+         replay reads."
+    )]
+    ChainNotIndexed { chain: String },
+
     /// A handler's migrations would collide with the framework's or another handler's.
     ///
     /// sqlx keys `_sqlx_migrations` by version alone, so this is caught at startup rather

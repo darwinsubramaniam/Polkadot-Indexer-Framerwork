@@ -35,12 +35,30 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// idempotent.
 const SYNC_EVERY: u64 = 64;
 
+/// How long to wait before re-checking the digest watermark while the brake is on.
+const BRAKE_POLL: Duration = Duration::from_millis(250);
+
+/// No brake at all — an archive endpoint serves state at any depth, so there is nothing for
+/// the fetcher to outrun.
+pub const UNBOUNDED_LAG: u64 = u64::MAX;
+
 /// Archives blocks from one chain, holding the connection and the metadata it has seen.
 struct Fetcher<'a> {
     pool: &'a PgPool,
     chain: &'a ChainClient,
     store: &'a HotStore,
     spec_name: &'a str,
+    /// How far ahead of the digest this may get, in blocks.
+    ///
+    /// Not a throughput knob. The storage read cache is filled on the *first* digest of a
+    /// block, from a node, so a fetcher far ahead means every one of those reads asks for
+    /// state the node discarded long ago. The brake makes that structurally impossible
+    /// rather than merely unlikely, and it is the same thing that stops the archive growing
+    /// without bound when the digest stalls.
+    max_lag: u64,
+    /// Whether the brake has already been reported. Engaging it is normal; saying so every
+    /// 250 ms is not.
+    braked: bool,
     /// Runtimes already archived in this run. The store is the durable record; this only
     /// avoids re-asking it once per block.
     seen: HashSet<u32>,
@@ -57,12 +75,15 @@ impl<'a> Fetcher<'a> {
         chain: &'a ChainClient,
         store: &'a HotStore,
         spec_name: &'a str,
+        max_lag: u64,
     ) -> Self {
         Self {
             pool,
             chain,
             store,
             spec_name,
+            max_lag,
+            braked: false,
             seen: HashSet::new(),
             last_spec: None,
             unsynced: 0,
@@ -75,8 +96,68 @@ impl<'a> Fetcher<'a> {
 
     /// Archive the block at `number`, and make it visible to the digest when it is durable.
     async fn archive(&mut self, number: u64) -> Result<()> {
+        self.wait_for_digest(number).await?;
         let at = decode::at_block(&self.chain.client, self.info(), number).await?;
         self.archive_at(&at).await
+    }
+
+    /// Hold here until the digest is close enough behind that this block's state will still
+    /// exist when the digest asks for it.
+    ///
+    /// A published watermark rather than a channel, so this works whether the digest is the
+    /// other half of `pif index` or a separate `pif digest` process — and so a `pif fetch`
+    /// run with nothing digesting stalls *visibly*, which is the honest outcome rather than
+    /// filling a disk with blocks whose state can never be read.
+    async fn wait_for_digest(&mut self, number: u64) -> Result<()> {
+        if self.max_lag == UNBOUNDED_LAG {
+            return Ok(());
+        }
+
+        loop {
+            let digested = match repo::load_watermarks(self.pool, &self.info().id).await? {
+                Some(marks) => marks.digest,
+                None => -1,
+            };
+
+            let ceiling = digested.saturating_add(self.max_lag as i64);
+            if (number as i64) <= ceiling {
+                if self.braked {
+                    tracing::info!(
+                        chain = %self.info().id, block = number, digested,
+                        "fetch: resuming, the digest caught up"
+                    );
+                    self.braked = false;
+                }
+                return Ok(());
+            }
+
+            if !self.braked {
+                // Publish before waiting, always. The watermark otherwise advances only
+                // every `SYNC_EVERY` blocks, so a `max_digest_lag` below that would have the
+                // fetcher holding for a digest that is waiting for a watermark this stage
+                // will now never move — the two stages deadlocked, each blocked on the
+                // other. Nothing more is archived while the brake is on, so one publish here
+                // is enough.
+                if self.unsynced > 0 && number > 0 {
+                    self.publish(number - 1).await?;
+                    continue;
+                }
+
+                tracing::warn!(
+                    chain = %self.info().id,
+                    block = number,
+                    digested,
+                    max_digest_lag = self.max_lag,
+                    "fetch: holding for the digest. Archiving further ahead would leave the \
+                     digest asking this endpoint for state it has already pruned. If nothing \
+                     is digesting this chain, start `pif digest` or raise \
+                     pipeline.max_digest_lag."
+                );
+                self.braked = true;
+            }
+
+            tokio::time::sleep(BRAKE_POLL).await;
+        }
     }
 
     /// Archive an already-resolved block.
@@ -287,44 +368,57 @@ impl<'a> Fetcher<'a> {
     }
 }
 
-/// Fetch blocks for one chain: catch up to the finalized head, then follow it.
-pub async fn run(
-    pool: &PgPool,
-    config: &ChainConfig,
-    chain: &ChainClient,
-    store: &HotStore,
-    spec_name: &str,
-    start: u64,
-    stop_at: Option<u64>,
-) -> Result<()> {
-    let mut fetcher = Fetcher::new(pool, chain, store, spec_name);
+/// Everything the fetch stage needs that does not change from block to block.
+pub struct Fetch<'a> {
+    pub pool: &'a PgPool,
+    pub config: &'a ChainConfig,
+    pub chain: &'a ChainClient,
+    pub store: &'a HotStore,
+    pub spec_name: &'a str,
+    /// How far ahead of the digest this may get. [`UNBOUNDED_LAG`] for an archive endpoint,
+    /// which can still answer for state at any depth.
+    pub max_lag: u64,
+}
 
-    let target = chain.finalized_number().await?;
-    let catch_up_end = stop_at.map(|s| s.min(target)).unwrap_or(target);
-    tracing::info!(
-        chain = %config.id, start, finalized_head = target, "fetch: starting catch-up"
-    );
+impl Fetch<'_> {
+    /// Fetch blocks for one chain: catch up to the finalized head, then follow it.
+    pub async fn run(&self, start: u64, stop_at: Option<u64>) -> Result<()> {
+        let config = self.config;
+        let mut fetcher = Fetcher::new(
+            self.pool,
+            self.chain,
+            self.store,
+            self.spec_name,
+            self.max_lag,
+        );
 
-    for number in start..=catch_up_end {
-        fetcher.archive(number).await?;
+        let target = self.chain.finalized_number().await?;
+        let catch_up_end = stop_at.map(|s| s.min(target)).unwrap_or(target);
+        tracing::info!(
+            chain = %config.id, start, finalized_head = target, "fetch: starting catch-up"
+        );
 
-        if number % 100 == 0 || number == catch_up_end {
-            tracing::info!(chain = %config.id, block = number, "fetched");
+        for number in start..=catch_up_end {
+            fetcher.archive(number).await?;
+
+            if number.is_multiple_of(100) || number == catch_up_end {
+                tracing::info!(chain = %config.id, block = number, "fetched");
+            }
         }
-    }
 
-    if catch_up_end >= start {
-        fetcher.publish(catch_up_end).await?;
-    }
+        if catch_up_end >= start {
+            fetcher.publish(catch_up_end).await?;
+        }
 
-    if let Some(stop) = stop_at
-        && catch_up_end >= stop
-    {
-        tracing::info!(chain = %config.id, stop, "fetch: reached stop_at, finishing");
-        return Ok(());
-    }
+        if let Some(stop) = stop_at
+            && catch_up_end >= stop
+        {
+            tracing::info!(chain = %config.id, stop, "fetch: reached stop_at, finishing");
+            return Ok(());
+        }
 
-    follow_head(pool, config, &mut fetcher, stop_at).await
+        follow_head(self.pool, config, &mut fetcher, stop_at).await
+    }
 }
 
 /// Follow the finalized head, archiving each block as it is finalized.

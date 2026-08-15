@@ -162,12 +162,13 @@ test-upgrade-boundary:
 test-offline-decode:
     cargo test -p pif-e2e --test decode_stored_spike -- --ignored --nocapture
 
-# The pipeline split end to end (IPD-002 phase 1). Needs `just up`.
+# The pipeline split end to end (IPD-002 phases 1 and 2). Needs `just up`.
 #
 # The test that matters most is `the_split_pipeline_writes_the_same_rows`: the archive is
-# worth nothing if the blocks it yields differ from the ones the network yielded. The one
-# that matters second replays against a dead address, so a replay that quietly became a
-# re-download would fail rather than pass slowly.
+# worth nothing if the blocks it yields differ from the ones the network yielded. The two
+# that matter next replay against a dead address — once for the dynamic core, once with a
+# handler that reads chain state — so a replay that quietly became a re-download would fail
+# rather than pass slowly.
 test-pipeline-split: up
     cargo test -p pif-e2e --test pipeline_split -- --ignored --nocapture --test-threads=1
 

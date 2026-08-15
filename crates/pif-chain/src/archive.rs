@@ -65,6 +65,15 @@ impl<'a> Archive<'a> {
         Ok(self.store.has_block(&self.chain.id, number)?)
     }
 
+    /// The decoded metadata for a runtime, if this archive has already loaded it.
+    ///
+    /// Handed to the storage cache so `has_pallet` can be answered with no node attached —
+    /// otherwise it is the one `StorageAt` method with nothing to consult during a replay.
+    /// Only ever a cache read: a caller that has just decoded a block is guaranteed a hit.
+    pub fn metadata_for(&self, spec_version: u32) -> Option<ArcMetadata> {
+        self.metadata.get(&spec_version).map(Arc::clone)
+    }
+
     /// Decode an archived block into the rows the digest writes.
     pub async fn decode(&mut self, raw: &RawBlock) -> Result<BlockData> {
         self.ensure_client(raw)?;

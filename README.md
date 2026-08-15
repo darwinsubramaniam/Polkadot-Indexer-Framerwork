@@ -18,7 +18,7 @@ denormalised tables (`transfers`) for the queries that matter most.
 | `crates/pif-core` | `polkadot-indexer-core` | `pif_core` | config, errors, SCALE→JSON codec, SS58 |
 | `crates/pif-db` | `polkadot-indexer-db` | `pif_db` | Postgres persistence, migrations, repositories |
 | `crates/pif-chain` | `polkadot-indexer-chain` | `pif_chain` | subxt client, dynamic decoder, handler registry, pipeline |
-| `crates/pif-store` | `polkadot-indexer-store` | `pif_store` | local block archive — segment files, runtime metadata |
+| `crates/pif-store` | `polkadot-indexer-store` | `pif_store` | local archive — block segments, runtime metadata, storage reads |
 | `crates/pif-api` | `polkadot-indexer-api` | `pif_api` | extensible GraphQL schema + axum server |
 | `crates/pif-identity` | `polkadot-indexer-identity` | `pif_identity` | People-chain identities, usernames and the alias cross-check |
 | `crates/pif-cli` | `polkadot-indexer-cli` | — | reference binary, `pif` |
@@ -30,17 +30,26 @@ bytes on disk and nothing else.
 
 ## The data pipeline
 
-Fetching a block and processing it are two separate stages, with a local archive of raw
-blocks between them:
+Fetching a block and processing it are two separate stages, with a local archive between
+them:
 
 ```
-several blocks at a time          one block at a time
-   ┌──────────┐                     ┌──────────┐
-   │  fetch   │──► segment files ──►│  digest  │──► Postgres
-   └──────────┘     + metadata      └──────────┘
-        │                                 │
-   fetch_watermark ───────────────► digest_watermark
+   ┌──────────┐                          ┌──────────┐
+   │  fetch   │──► blocks + metadata ───►│  digest  │──► Postgres
+   └──────────┘                          └──────────┘
+        │                                   │    ▲
+   fetch_watermark ──────────► digest_watermark  │
+                                             ▼    │
+                                   storage reads ─┘
+                              (miss → node, once, ever)
 ```
+
+The archive holds two things, because **a block archive is not a state archive**. Handlers
+do not read only blocks; they read chain state. `pallet_identity` emits
+`IdentitySet { who }` with no display name, so the event says *which* key changed and only
+storage says *what* it changed to. Archiving blocks alone would move the RPC load rather
+than removing it — onto the most expensive call a public endpoint offers, historical state
+on an archive node. So the answers are archived too, keyed by the block they were read at.
 
 The payoff is not primarily speed. It is that **a re-index stops costing a re-download**:
 
@@ -58,14 +67,20 @@ rather than re-fetching its history.
 
 Configure where the archive lives with a `[pipeline]` table (see `config/chains.toml`); it
 defaults to `.pif-store` beside the config file. Sizing: Polkadot is ~28M blocks at roughly
-5–15 KB raw per block with events, so 200–400 GB uncompressed and 60–120 GB with zstd.
+5–15 KB raw per block with events, so 200–400 GB uncompressed and 60–120 GB with zstd. The
+storage read cache for a state-heavy handler such as `identity` can exceed the blocks
+themselves; `pif store status` reports the two separately.
 
-> **Handlers that read chain state still need a node.** Archiving blocks makes the *dynamic
-> core* replayable. Chain **state** is not in a block — `pallet_identity` emits
-> `IdentitySet { who }` with no display name, so only storage says what it changed to — and
-> it is not archived yet. A replay of a chain with such a handler reports
-> `StorageNotArchived` rather than quietly reaching for the network. Chains with no
-> handlers, and the whole dynamic core, replay entirely offline today.
+`pif replay` **never opens a connection.** Not "does not usually" — a replay that quietly
+falls back to the network is indistinguishable from one that worked, until the bill arrives.
+Anything the archive cannot answer stops it by name: `BlockNotArchived`,
+`MetadataNotArchived`, `StorageNotArchived`.
+
+> **The fetch stage will not outrun the digest.** The storage read cache is filled on the
+> *first* digest of a block, from a node, so a fetcher far ahead means those reads ask for
+> state the node has already pruned. `max_digest_lag` makes that structurally impossible: it
+> defaults to unbounded against an archive endpoint and 256 otherwise, probed at connect. It
+> is also what stops the archive growing without bound when the digest stalls.
 
 > **Light-client chains are not split.** A split digest resolves each block by *number*, and
 > that is the one question smoldot refuses to answer. Those chains keep the
@@ -382,8 +397,16 @@ five Polkadot parachains in one process costs one relay light client, not five.
 **Handlers can read chain state, not just events.** `BlockContext::storage` exposes the
 block's state through the same dynamic, metadata-driven path the decoder uses. It exists
 because some pallets report *that* something changed without reporting *what* — see the
-identity section above. It costs an RPC round-trip inside the block's transaction, so read
-only when an event says something changed.
+identity section above. The first read at a block costs an RPC round-trip inside the block's
+transaction; every later read of the same key at the same block is served from the archive.
+Read only when an event says something changed.
+
+**A cached absence is an answer, not a gap.** `Ok(None)` — "this account has no identity" —
+is the *common* result, not the exceptional one, so it is archived like any other. A cache
+that stored only hits would go back to the network on every replay for the overwhelming
+majority of reads, which is the same as having no cache at all. `StorageAt::iter` is
+deliberately excluded: it is the bootstrap sweep, tens of thousands of keys that would dwarf
+the blocks, already guarded by its own table.
 
 **Only finalized blocks are indexed.** `stream_blocks()` yields finalized blocks, which
 cannot be reverted, so there is no reorg-handling code and the stored chain can never contain
@@ -504,8 +527,7 @@ driven through the CLI rather than the SDK, and a known multi-node peering limit
 
 ## Not yet implemented
 
-Archiving of handler **storage reads** (so a chain with the identity handler replays offline
-too), multi-endpoint fetch with per-endpoint rate limiting, batched multi-row inserts, cold
+Multi-endpoint fetch with per-endpoint rate limiting, batched multi-row inserts, cold
 tiering of digested segments to a second disk, reorg handling for non-finalized tailing,
 Prometheus metrics, custom `Config` types for Ethereum-style chains (Moonbeam), XCM
 correlation across relay/parachain, and table partitioning by `chain_id`.

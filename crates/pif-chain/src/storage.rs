@@ -57,62 +57,12 @@ pub trait StorageAt: Send + Sync {
     ) -> Result<BoxStream<'s, Result<(Vec<u8>, Json)>>>;
 }
 
-/// [`StorageAt`] with no node behind it.
-///
-/// Used when the digest runs against the archive alone — `pif replay` against a chain whose
-/// handlers read state, or `pif digest` with no endpoint configured. Every read is a loud
-/// error rather than a silent fall-back to the network, because a replay that quietly
-/// becomes a re-download is exactly the failure the archive exists to prevent, and nobody
-/// notices until the bill arrives.
-///
-/// This is the seam the storage read cache slots into: the same decorator position, with a
-/// local cache answering the reads instead of nothing answering them.
-pub struct OfflineStorage<'a> {
-    chain_id: &'a str,
-    block: u64,
-}
-
-impl<'a> OfflineStorage<'a> {
-    pub fn new(chain_id: &'a str, block: u64) -> Self {
-        Self { chain_id, block }
-    }
-
-    fn not_archived(&self, pallet: &str, entry: &str) -> ChainError {
-        ChainError::StorageNotArchived {
-            chain: self.chain_id.to_owned(),
-            number: self.block,
-            pallet: pallet.to_owned(),
-            entry: entry.to_owned(),
-        }
-    }
-}
-
-#[async_trait]
-impl StorageAt for OfflineStorage<'_> {
-    fn block_number(&self) -> u64 {
-        self.block
-    }
-
-    /// Reported as present, so a handler asks and gets the precise error from `fetch` rather
-    /// than concluding the chain does not have the pallet and skipping the block silently.
-    fn has_pallet(&self, _pallet: &str) -> bool {
-        true
-    }
-
-    async fn fetch(&self, pallet: &str, entry: &str, _keys: Vec<Value>) -> Result<Option<Json>> {
-        Err(self.not_archived(pallet, entry))
-    }
-
-    async fn iter<'s>(
-        &'s self,
-        pallet: String,
-        entry: String,
-    ) -> Result<BoxStream<'s, Result<(Vec<u8>, Json)>>> {
-        Err(self.not_archived(&pallet, &entry))
-    }
-}
-
 /// [`StorageAt`] backed by a live node, through subxt's dynamic storage API.
+///
+/// The digest does not use this directly — it goes through [`crate::cache::CachedStorage`],
+/// which answers from the archive first and delegates here only on a miss. This stays as the
+/// unconditional live path, for the handler bootstrap sweep and for anything that genuinely
+/// wants the node.
 pub struct SubxtStorage<'a> {
     at: &'a AtBlock,
     chain_id: &'a str,
@@ -121,31 +71,6 @@ pub struct SubxtStorage<'a> {
 impl<'a> SubxtStorage<'a> {
     pub fn new(at: &'a AtBlock, chain_id: &'a str) -> Self {
         Self { at, chain_id }
-    }
-
-    /// Turn a subxt storage failure into a `ChainError`.
-    ///
-    /// Pruning is separated out because it is the one failure with an actionable fix, and the
-    /// raw message ("State already discarded") does not say what it is. Reuses the same
-    /// detector the block-read path uses, so both report it identically.
-    fn storage_error(
-        &self,
-        pallet: &str,
-        entry: &str,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> ChainError {
-        if is_pruned_state(&source) {
-            return ChainError::PrunedState {
-                chain: self.chain_id.to_owned(),
-                number: self.at.block_number(),
-            };
-        }
-        ChainError::StorageRead {
-            pallet: pallet.to_owned(),
-            entry: entry.to_owned(),
-            number: self.at.block_number(),
-            source: Box::new(source),
-        }
     }
 }
 
@@ -160,28 +85,7 @@ impl StorageAt for SubxtStorage<'_> {
     }
 
     async fn fetch(&self, pallet: &str, entry: &str, keys: Vec<Value>) -> Result<Option<Json>> {
-        // A `(pallet, entry)` tuple is subxt's dynamic address: key parts and value are both
-        // `scale_value::Value`, decoded against the block's own metadata.
-        let found = match self.at.storage().try_fetch((pallet, entry), keys).await {
-            Ok(found) => found,
-            // An entry this runtime does not have is "no value", not a failure. Storage items
-            // come and go across runtime versions — `Identity::UsernameOf` did not exist
-            // before usernames shipped — and a handler indexing history across an upgrade
-            // must not die at the boundary. A missing *pallet* is still loud, via
-            // `has_pallet`, because that means the handler is pointed at the wrong chain.
-            Err(subxt::error::StorageError::StorageEntryNotFound { .. }) => return Ok(None),
-            Err(e) => return Err(self.storage_error(pallet, entry, e)),
-        };
-
-        let Some(value) = found else {
-            return Ok(None);
-        };
-
-        let decoded = value
-            .decode()
-            .map_err(|e| self.storage_error(pallet, entry, e))?;
-
-        Ok(Some(codec::value_to_json(&decoded)))
+        fetch_at(self.at, self.chain_id, pallet, entry, keys).await
     }
 
     async fn iter<'s>(
@@ -189,37 +93,92 @@ impl StorageAt for SubxtStorage<'_> {
         pallet: String,
         entry: String,
     ) -> Result<BoxStream<'s, Result<(Vec<u8>, Json)>>> {
-        // The address takes owned names, so nothing stays borrowed from `pallet`/`entry` and
-        // they are free to move into the stream closure below. An empty key prefix means
-        // "every entry in the map".
-        let entries = self
-            .at
-            .storage()
-            .iter((pallet.clone(), entry.clone()), Vec::<Value>::new())
-            .await
-            .map_err(|e| self.storage_error(&pallet, &entry, e))?;
-
-        let chain_id = self.chain_id.to_owned();
-        let number = self.at.block_number();
-
-        let stream = entries.map(move |item| {
-            let kv = item.map_err(|e| map_stream_error(&chain_id, number, &pallet, &entry, e))?;
-            // `key_bytes` borrows from `kv`, so copy before it is dropped.
-            let key = kv.key_bytes().to_vec();
-            let value = kv
-                .value()
-                .decode()
-                .map_err(|e| map_stream_error(&chain_id, number, &pallet, &entry, e))?;
-            Ok((key, codec::value_to_json(&value)))
-        });
-
-        Ok(stream.boxed())
+        iter_at(self.at, self.chain_id, pallet, entry).await
     }
 }
 
-/// Same mapping as `SubxtStorage::storage_error`, for use inside the stream closure where
-/// `self` cannot be borrowed.
-fn map_stream_error(
+/// Read one storage entry from a live block.
+///
+/// A free function rather than a method so the cache decorator can call it holding a
+/// long-lived `&AtBlock` of its own. One implementation, so a cached digest and an uncached
+/// one cannot decode a value differently — a divergence the archive would preserve forever.
+pub(crate) async fn fetch_at(
+    at: &AtBlock,
+    chain_id: &str,
+    pallet: &str,
+    entry: &str,
+    keys: Vec<Value>,
+) -> Result<Option<Json>> {
+    let number = at.block_number();
+
+    // A `(pallet, entry)` tuple is subxt's dynamic address: key parts and value are both
+    // `scale_value::Value`, decoded against the block's own metadata.
+    let found = match at.storage().try_fetch((pallet, entry), keys).await {
+        Ok(found) => found,
+        // An entry this runtime does not have is "no value", not a failure. Storage items
+        // come and go across runtime versions — `Identity::UsernameOf` did not exist
+        // before usernames shipped — and a handler indexing history across an upgrade
+        // must not die at the boundary. A missing *pallet* is still loud, via
+        // `has_pallet`, because that means the handler is pointed at the wrong chain.
+        Err(subxt::error::StorageError::StorageEntryNotFound { .. }) => return Ok(None),
+        Err(e) => return Err(storage_error(chain_id, number, pallet, entry, e)),
+    };
+
+    let Some(value) = found else {
+        return Ok(None);
+    };
+
+    let decoded = value
+        .decode()
+        .map_err(|e| storage_error(chain_id, number, pallet, entry, e))?;
+
+    Ok(Some(codec::value_to_json(&decoded)))
+}
+
+/// Stream every `(key_bytes, value)` in a storage map at a live block.
+///
+/// The returned stream borrows `at`, which is why this takes it by reference rather than
+/// being a method: the cache decorator owns its `AtBlock` and can lend it for as long as the
+/// stream lives, where a temporary `SubxtStorage` could not.
+pub(crate) async fn iter_at<'a>(
+    at: &'a AtBlock,
+    chain_id: &'a str,
+    pallet: String,
+    entry: String,
+) -> Result<BoxStream<'a, Result<(Vec<u8>, Json)>>> {
+    let number = at.block_number();
+
+    // The address takes owned names, so nothing stays borrowed from `pallet`/`entry` and
+    // they are free to move into the stream closure below. An empty key prefix means
+    // "every entry in the map".
+    let entries = at
+        .storage()
+        .iter((pallet.clone(), entry.clone()), Vec::<Value>::new())
+        .await
+        .map_err(|e| storage_error(chain_id, number, &pallet, &entry, e))?;
+
+    let chain_id = chain_id.to_owned();
+
+    let stream = entries.map(move |item| {
+        let kv = item.map_err(|e| storage_error(&chain_id, number, &pallet, &entry, e))?;
+        // `key_bytes` borrows from `kv`, so copy before it is dropped.
+        let key = kv.key_bytes().to_vec();
+        let value = kv
+            .value()
+            .decode()
+            .map_err(|e| storage_error(&chain_id, number, &pallet, &entry, e))?;
+        Ok((key, codec::value_to_json(&value)))
+    });
+
+    Ok(stream.boxed())
+}
+
+/// Turn a subxt storage failure into a `ChainError`.
+///
+/// Pruning is separated out because it is the one failure with an actionable fix, and the
+/// raw message ("State already discarded") does not say what it is. Reuses the same detector
+/// the block-read path uses, so both report it identically.
+fn storage_error(
     chain_id: &str,
     number: u64,
     pallet: &str,

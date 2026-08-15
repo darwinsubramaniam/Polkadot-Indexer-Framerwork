@@ -9,23 +9,24 @@
 //! question would step straight over a hole and record a gap as success. It asks
 //! `n <= fetch_watermark` instead, and only completed, synced work advances that.
 //!
-//! Handlers that read chain *state* still reach the network in this phase: state is not in
-//! the block, so archiving blocks does not archive it. That is the one thing standing
-//! between here and a fully offline replay.
+//! Handlers that read chain *state* are served from the archive too. A block archive is not
+//! a state archive — `pallet_identity` emits `IdentitySet { who }` with no display name — so
+//! those reads are archived separately, keyed by the block they were made at. On the first
+//! digest a read misses and goes to the node; on every later one it hits, and a replay needs
+//! no network at all.
 
 use std::time::Duration;
 
 use pif_core::ChainInfo;
 use pif_db::repo;
-use pif_store::HotStore;
+use pif_store::{HotStore, StorageCache};
 use sqlx::PgPool;
 
 use crate::archive::Archive;
+use crate::cache::CachedStorage;
 use crate::client::ChainClient;
-use crate::decode;
 use crate::error::{ChainError, Result};
 use crate::handlers::{BlockContext, Selected};
-use crate::storage::{OfflineStorage, StorageAt, SubxtStorage};
 
 /// How long to wait before re-reading `fetch_watermark` when the digest has caught up.
 ///
@@ -38,12 +39,14 @@ pub struct Digest<'a> {
     pub pool: &'a PgPool,
     pub chain: &'a ChainInfo,
     pub store: &'a HotStore,
+    /// Archived answers to handler storage reads, keyed by the block they were made at.
+    pub reads: &'a StorageCache,
     pub handlers: &'a Selected<'a>,
-    /// What the digest may reach for when a handler reads chain state.
+    /// What the digest may reach for on a storage read the archive cannot answer.
     ///
     /// `None` means there is no node — a `pif replay`, or a `pif digest` against a chain
-    /// with no reachable endpoint. Decoding still works; a handler's storage read does not,
-    /// and says so.
+    /// with no reachable endpoint. Decoding still works; an unarchived storage read does
+    /// not, and says so by name rather than reaching for the network behind your back.
     pub live: Option<&'a ChainClient>,
     pub spec_name: &'a str,
 }
@@ -96,6 +99,10 @@ impl Digest<'_> {
                 next += 1;
             }
 
+            // Caught up. Flushing here rather than per block because a lost cache entry
+            // costs one refetch on the next pass, never a hole — so paying an fsync per
+            // block would buy nothing the watermarks do not already guarantee.
+            self.reads.sync()?;
             tokio::time::sleep(IDLE_POLL).await;
         }
     }
@@ -120,6 +127,7 @@ impl Digest<'_> {
             }
         }
 
+        self.reads.sync()?;
         Ok(())
     }
 
@@ -165,27 +173,22 @@ impl Digest<'_> {
         }
 
         // State at this exact block, for handlers whose pallet reports *that* something
-        // changed without reporting *what* it changed to. Resolved only when a handler might
-        // ask: with no handlers the digest touches no network at all, which is the property
-        // `pif replay` rests on.
-        let at = match live {
-            Some(client) if !handlers.is_empty() => {
-                Some(decode::at_block(&client.client, chain, number).await?)
-            }
-            _ => None,
-        };
-        let live_storage = at.as_ref().map(|at| SubxtStorage::new(at, &chain.id));
-        let offline_storage = OfflineStorage::new(&chain.id, number);
-        let storage: &dyn StorageAt = match &live_storage {
-            Some(storage) => storage,
-            None => &offline_storage,
-        };
+        // changed without reporting *what* it changed to. Answered from the archive when it
+        // has been read here before; only a genuine miss touches the network, and only if
+        // there is a node to touch.
+        let storage = CachedStorage::new(
+            self.reads,
+            chain,
+            number,
+            live.map(|client| &client.client),
+            archive.metadata_for(raw.spec_version),
+        );
 
         let ctx = BlockContext {
             chain,
             block_number: number,
             block_hash: &data.block.hash,
-            storage,
+            storage: &storage,
         };
 
         let mut tx = pool.begin().await?;
@@ -197,6 +200,11 @@ impl Digest<'_> {
         repo::update_cursor(&mut tx, &chain.id, data.block.number, &data.block.hash).await?;
         repo::advance_digest_watermark(&mut tx, &chain.id, data.block.number).await?;
         tx.commit().await?;
+
+        // After the commit, not before: the archive should record reads belonging to a block
+        // that actually landed. A block whose reads all hit writes nothing at all, so a warm
+        // re-digest does not churn the cache.
+        storage.persist()?;
 
         Ok(data.block.hash)
     }

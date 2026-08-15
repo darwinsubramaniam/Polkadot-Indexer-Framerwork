@@ -28,21 +28,22 @@ light-client = ["pif-chain/light-client"]
 
 [dependencies]
 pif-chain.workspace = true
+pif-core.workspace = true
+pif-db.workspace = true
+async-trait.workspace = true
+scale-value.workspace = true
+sqlx.workspace = true
 pif-example-balances = { workspace = true, optional = true }
 pif-identity = { workspace = true, optional = true }
 anyhow.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-pif-core.workspace = true
-pif-db.workspace = true
-
 subxt.workspace = true
 subxt-signer.workspace = true
 scale-value.workspace = true
 parity-scale-codec.workspace = true
 scale-info = "2.11"
-sqlx.workspace = true
 tokio.workspace = true
 futures.workspace = true
 anyhow.workspace = true

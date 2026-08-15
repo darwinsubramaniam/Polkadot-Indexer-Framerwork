@@ -16,17 +16,29 @@
 //!   unique only because a finalized block cannot be reverted. Anything that later archives
 //!   unfinalized blocks gets a silent key collision rather than an error.
 //!
+//! Two stores live under one root, keyed the same way and holding different things:
+//!
+//! * [`HotStore`] — the blocks themselves, plus runtime metadata per `spec_version`.
+//! * [`StorageCache`] — the answers handlers got when they read chain **state** at a block.
+//!   A block archive is not a state archive: `pallet_identity` emits `IdentitySet { who }`
+//!   with no display name, so archiving blocks alone would move the RPC load onto historical
+//!   state reads rather than removing it.
+//!
 //! This crate owns bytes on disk and nothing else: no Postgres, no subxt, no knowledge of
 //! the traits or error types above it. That is a compile requirement rather than a
 //! preference — see IPD-002 §11.1.1.
 
+pub mod cache;
 pub mod error;
 pub mod hot;
 pub mod layout;
 pub mod raw;
 pub mod segment;
+mod segstore;
 
+pub use cache::{BlockReads, ReadKey, StorageCache};
 pub use error::{Result, StoreError};
 pub use hot::{HotStore, StoreUsage};
 pub use layout::DEFAULT_SEGMENT_SIZE;
 pub use raw::RawBlock;
+pub use segstore::Usage;

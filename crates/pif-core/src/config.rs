@@ -34,8 +34,8 @@ pub struct IndexerConfig {
 /// asking the network again.
 ///
 /// Only the settings the current pipeline honours are here. The rest of IPD-002's table —
-/// `cold_path`, `retention`, `on_digest`, `max_digest_lag` — arrives with the phases that
-/// act on them, rather than sitting in the config doing nothing.
+/// `cold_path`, `retention`, `on_digest` — arrives with the phases that act on them, rather
+/// than sitting in the config doing nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
@@ -51,6 +51,18 @@ pub struct PipelineConfig {
     /// unfindable, so it is chosen once per store, not tuned.
     #[serde(default = "default_segment_size")]
     pub segment_size: u64,
+
+    /// How far the fetch stage may run ahead of the digest, in blocks.
+    ///
+    /// The brake exists because the storage read cache is filled on the *first* digest of a
+    /// block, from a node. A fetcher 100k blocks ahead means every one of those reads asks
+    /// for state the node discarded long ago — Substrate defaults to `--state-pruning 256`
+    /// — so the digest would fail on state it could have had if it had simply kept up.
+    ///
+    /// Omit to decide from the endpoint: an archive node gets no brake, anything else gets
+    /// 256. Set it to bound how far the archive can grow ahead of Postgres regardless.
+    #[serde(default)]
+    pub max_digest_lag: Option<u64>,
 }
 
 fn default_hot_path() -> PathBuf {
@@ -66,6 +78,7 @@ impl Default for PipelineConfig {
         Self {
             hot_path: default_hot_path(),
             segment_size: default_segment_size(),
+            max_digest_lag: None,
         }
     }
 }
@@ -420,6 +433,16 @@ impl IndexerConfig {
                 if pipeline.hot_path.as_os_str().is_empty() {
                     return Err(Error::ConfigInvalid(format!(
                         "chain {:?}: pipeline.hot_path must not be empty",
+                        chain.id
+                    )));
+                }
+                // Zero would stall the fetcher against a digest that has not started, which
+                // looks exactly like a hang. Omitting the key is how you ask for the
+                // default; there is no sensible reading of "run zero blocks ahead".
+                if pipeline.max_digest_lag == Some(0) {
+                    return Err(Error::ConfigInvalid(format!(
+                        "chain {:?}: pipeline.max_digest_lag must be at least 1; omit it to \
+                         decide from the endpoint",
                         chain.id
                     )));
                 }

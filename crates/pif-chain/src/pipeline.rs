@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use pif_core::{ChainConfig, ChainInfo};
 use pif_db::repo;
-use pif_store::HotStore;
+use pif_store::{HotStore, StorageCache};
 use sqlx::PgPool;
 
 use crate::client::ChainClient;
@@ -75,7 +75,8 @@ pub async fn run(
         return follow_only(pool, config, &chain, handlers, &spec_name, &options).await;
     }
 
-    let store = open_store(config)?;
+    let archives = open_archives(config)?;
+    let max_lag = resolve_max_lag(config, &chain).await?;
 
     let start = resolve_start(pool, config, options.from).await?;
 
@@ -101,22 +102,24 @@ pub async fn run(
     let digest = digest::Digest {
         pool,
         chain: &chain.info,
-        store: &store,
+        store: &archives.blocks,
+        reads: &archives.reads,
         handlers,
         live: Some(&chain),
         spec_name: &spec_name,
     };
 
+    let fetch = fetch::Fetch {
+        pool,
+        config,
+        chain: &chain,
+        store: &archives.blocks,
+        spec_name: &spec_name,
+        max_lag,
+    };
+
     tokio::try_join!(
-        fetch::run(
-            pool,
-            config,
-            &chain,
-            &store,
-            &spec_name,
-            start,
-            options.stop_at
-        ),
+        fetch.run(start, options.stop_at),
         digest.run(start, options.stop_at),
     )?;
 
@@ -129,34 +132,35 @@ pub async fn run(
 /// through a runtime the digest cannot yet read.
 pub async fn fetch_only(pool: &PgPool, config: &ChainConfig, options: IndexOptions) -> Result<()> {
     let chain = connect_and_identify(pool, config).await?;
-    let store = open_store(config)?;
+    let archives = open_archives(config)?;
+    let max_lag = resolve_max_lag(config, &chain.client).await?;
     let start = resolve_start(pool, config, options.from).await?;
 
-    fetch::run(
+    fetch::Fetch {
         pool,
         config,
-        &chain.client,
-        &store,
-        &chain.spec_name,
-        start,
-        options.stop_at,
-    )
+        chain: &chain.client,
+        store: &archives.blocks,
+        spec_name: &chain.spec_name,
+        max_lag,
+    }
+    .run(start, options.stop_at)
     .await
 }
 
 /// Digest already-archived blocks and nothing else — `pif digest`.
 ///
-/// Connects only if a handler might read chain state. With no handlers this touches no
-/// network at all, which is what makes it usable against an archive whose chain is
-/// unreachable.
+/// Connects if it can, so a first-pass storage read has somewhere to go — but a warm archive
+/// needs nothing from the node, so an unreachable chain is a warning rather than a failure.
+/// Blocks and their metadata always come from local disk.
 pub async fn digest_only(
     pool: &PgPool,
     config: &ChainConfig,
     registry: &HandlerRegistry,
     options: IndexOptions,
 ) -> Result<()> {
-    let store = open_store(config)?;
-    let resolved = resolve_offline(pool, config).await?;
+    let archives = open_archives(config)?;
+    let resolved = resolve(pool, config, Reach::Preferred).await?;
     let handlers = &registry.select(&config.handlers, &resolved.info)?;
 
     let start = match options.from {
@@ -173,7 +177,8 @@ pub async fn digest_only(
     digest::Digest {
         pool,
         chain: &resolved.info,
-        store: &store,
+        store: &archives.blocks,
+        reads: &archives.reads,
         handlers,
         live: resolved.client.as_ref(),
         spec_name: &resolved.spec_name,
@@ -187,6 +192,11 @@ pub async fn digest_only(
 /// This is what the archive is *for*. Adding a handler, or fixing a decode bug, becomes a
 /// local operation over bytes already held: every insert is `ON CONFLICT DO NOTHING`, so
 /// replaying an already-indexed range is idempotent rather than an error.
+///
+/// **No node, ever.** Not an accident of what happens to be reachable: a replay that quietly
+/// falls back to the network is indistinguishable from one that worked, until the bill
+/// arrives. Anything the archive cannot answer — a block, a runtime's metadata, a storage
+/// read — stops the replay by name instead.
 pub async fn replay(
     pool: &PgPool,
     config: &ChainConfig,
@@ -198,8 +208,8 @@ pub async fn replay(
         return Err(ChainError::EmptyReplayRange { from, to });
     }
 
-    let store = open_store(config)?;
-    let resolved = resolve_offline(pool, config).await?;
+    let archives = open_archives(config)?;
+    let resolved = resolve(pool, config, Reach::Never).await?;
     let handlers = &registry.select(&config.handlers, &resolved.info)?;
 
     tracing::info!(chain = %config.id, from, to, "replaying from the archive");
@@ -207,9 +217,10 @@ pub async fn replay(
     digest::Digest {
         pool,
         chain: &resolved.info,
-        store: &store,
+        store: &archives.blocks,
+        reads: &archives.reads,
         handlers,
-        live: resolved.client.as_ref(),
+        live: None,
         spec_name: &resolved.spec_name,
     }
     .replay_range(from, to)
@@ -223,6 +234,12 @@ pub struct StoreStatus {
     /// `None` for a chain that has never been indexed here.
     pub watermarks: Option<pif_db::Watermarks>,
     pub usage: pif_store::StoreUsage,
+    /// What the archived handler storage reads occupy.
+    ///
+    /// Reported separately because it is sized by an entirely different thing: a state-heavy
+    /// handler such as `identity` can exceed the blocks themselves, so budgeting for it as
+    /// though it were part of them gets the disk wrong.
+    pub reads: pif_store::Usage,
     /// The unbroken run of archived blocks, from the lowest one held — what `pif replay` can
     /// actually reach. `None` when nothing is archived.
     ///
@@ -240,10 +257,11 @@ pub struct StoreStatus {
 ///
 /// Needs no node: everything here is on local disk or in Postgres.
 pub async fn store_status(pool: &PgPool, config: &ChainConfig) -> Result<StoreStatus> {
-    let store = HotStore::open(&config.pipeline().hot_path, config.pipeline().segment_size)?;
+    let archives = open_archives(config)?;
+    let blocks = &archives.blocks;
 
-    let replayable = match store.first_block(&config.id)? {
-        Some(first) => store
+    let replayable = match blocks.first_block(&config.id)? {
+        Some(first) => blocks
             .contiguous_end(&config.id, first)?
             .map(|last| (first, last)),
         None => None,
@@ -251,9 +269,10 @@ pub async fn store_status(pool: &PgPool, config: &ChainConfig) -> Result<StoreSt
 
     Ok(StoreStatus {
         chain_id: config.id.clone(),
-        path: store.root().display().to_string(),
+        path: blocks.root().display().to_string(),
         watermarks: repo::load_watermarks(pool, &config.id).await?,
-        usage: store.usage(&config.id)?,
+        usage: blocks.usage(&config.id)?,
+        reads: archives.reads.usage(&config.id)?,
         replayable,
         runtimes_without_metadata: repo::runtimes_without_metadata(pool, &config.id).await?,
     })
@@ -266,23 +285,33 @@ struct Resolved {
     client: Option<ChainClient>,
 }
 
-/// Identify a chain from the database where possible, connecting only if it is unavoidable.
+/// Whether a digest-side run may open a connection.
+enum Reach {
+    /// Connect if possible, so a first-pass storage miss has somewhere to go. Falls back to
+    /// the archive alone if the chain is already known and the node is unreachable.
+    Preferred,
+    /// Never connect. A miss is an error, by design.
+    Never,
+}
+
+/// Identify a chain well enough to decode it, from the database where possible.
 ///
 /// Everything decoding needs about a chain — its id and SS58 prefix — was recorded the first
-/// time it was indexed. Reading it back is what lets a replay run with the node switched
-/// off, which is the claim the archive exists to make good on. A connection is opened only
-/// when a handler will read chain state, because that is not in the archive yet.
-async fn resolve_offline(pool: &PgPool, config: &ChainConfig) -> Result<Resolved> {
+/// time it was indexed, and the archive holds the rest. Reading it back is what lets a
+/// replay run with the node switched off, which is the claim the archive exists to make good
+/// on.
+async fn resolve(pool: &PgPool, config: &ChainConfig, reach: Reach) -> Result<Resolved> {
     let stored = repo::load_chain(pool, &config.id).await?;
-    let known = stored.is_some();
-    let reads_state = !config.handlers.is_empty();
+    let spec_name = repo::latest_spec_name(pool, &config.id)
+        .await?
+        .unwrap_or_else(|| "unknown".to_owned());
 
-    if let Some(info) = stored
-        && !reads_state
-    {
-        let spec_name = repo::latest_spec_name(pool, &config.id)
-            .await?
-            .unwrap_or_else(|| "unknown".to_owned());
+    if let Reach::Never = reach {
+        // A chain with no rows here has no identity to decode against and no archive to read
+        // — there is nothing to replay, and connecting to find out would defeat the point.
+        let info = stored.ok_or_else(|| ChainError::ChainNotIndexed {
+            chain: config.id.clone(),
+        })?;
         return Ok(Resolved {
             info,
             spec_name,
@@ -290,25 +319,33 @@ async fn resolve_offline(pool: &PgPool, config: &ChainConfig) -> Result<Resolved
         });
     }
 
-    if !known {
-        tracing::info!(
-            chain = %config.id,
-            "this chain has never been indexed here, so its identity must come from the node"
-        );
-    } else {
-        tracing::info!(
-            chain = %config.id,
-            handlers = ?config.handlers,
-            "connecting: these handlers read chain state, which is not archived yet"
-        );
-    }
+    match connect_and_identify(pool, config).await {
+        Ok(connected) => Ok(Resolved {
+            info: connected.client.info.clone(),
+            spec_name: connected.spec_name,
+            client: Some(connected.client),
+        }),
 
-    let connected = connect_and_identify(pool, config).await?;
-    Ok(Resolved {
-        info: connected.client.info.clone(),
-        spec_name: connected.spec_name,
-        client: Some(connected.client),
-    })
+        // Unreachable, but the archive may still hold everything this run needs. Worth
+        // continuing rather than refusing: if a read then misses, `StorageNotArchived` names
+        // exactly what was wanted, which is more useful than a connection error would have
+        // been. A chain never indexed here has nothing to fall back on.
+        Err(e) => match stored {
+            Some(info) => {
+                tracing::warn!(
+                    chain = %config.id, error = %e,
+                    "could not connect; continuing from the archive alone. Anything it does \
+                     not hold will stop this run by name."
+                );
+                Ok(Resolved {
+                    info,
+                    spec_name,
+                    client: None,
+                })
+            }
+            None => Err(e),
+        },
+    }
 }
 
 /// A connected chain plus the runtime name the rows record.
@@ -343,17 +380,60 @@ async fn spec_name_of(chain: &ChainClient) -> Result<String> {
         .to_owned())
 }
 
-/// Open this chain's block archive.
-fn open_store(config: &ChainConfig) -> Result<HotStore> {
+/// This chain's two archives: the blocks, and the state its handlers read.
+struct Archives {
+    blocks: HotStore,
+    reads: StorageCache,
+}
+
+/// Open both halves of this chain's archive.
+///
+/// Two stores under one root, sharing a key — the block number — so a replay of a range
+/// reads both sequentially and, later, a cold tier can move both together.
+fn open_archives(config: &ChainConfig) -> Result<Archives> {
     let pipeline = config.pipeline();
-    let store = HotStore::open(&pipeline.hot_path, pipeline.segment_size)?;
+    let blocks = HotStore::open(&pipeline.hot_path, pipeline.segment_size)?;
+    let reads = StorageCache::open(&pipeline.hot_path, pipeline.segment_size)?;
+
     tracing::info!(
         chain = %config.id,
-        path = %store.root().display(),
-        segment_size = store.segment_size(),
+        path = %blocks.root().display(),
+        segment_size = blocks.segment_size(),
         "block archive ready"
     );
-    Ok(store)
+    Ok(Archives { blocks, reads })
+}
+
+/// How far the fetch stage may run ahead of the digest.
+///
+/// Configured value wins. Otherwise the endpoint decides, because the endpoint is what makes
+/// the brake necessary: the storage read cache is filled from a node on the first digest of
+/// each block, so the fetcher may only outrun the digest as far as that node can still
+/// answer for.
+async fn resolve_max_lag(config: &ChainConfig, chain: &ChainClient) -> Result<u64> {
+    if let Some(configured) = config.pipeline().max_digest_lag {
+        tracing::info!(chain = %config.id, max_digest_lag = configured, "fetch: lag from config");
+        return Ok(configured);
+    }
+
+    if chain.is_archive().await? {
+        tracing::info!(
+            chain = %config.id,
+            "endpoint serves archived state; the fetch stage may run as far ahead as it likes"
+        );
+        return Ok(fetch::UNBOUNDED_LAG);
+    }
+
+    // Substrate's `--state-pruning 256` default, which is what the endpoint just behaved
+    // like. Going further would mean the digest asking it for state it no longer has.
+    const PRUNED_NODE_LAG: u64 = 256;
+    tracing::info!(
+        chain = %config.id,
+        max_digest_lag = PRUNED_NODE_LAG,
+        "endpoint prunes state; holding the fetch stage near the digest so handler storage \
+         reads still have something to read"
+    );
+    Ok(PRUNED_NODE_LAG)
 }
 
 /// The watermark value meaning "everything below `start` is done, and nothing else is".

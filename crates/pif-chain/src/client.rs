@@ -13,6 +13,12 @@ use crate::error::{ChainError, Result};
 /// bridge between the two.
 pub type Rpc = LegacyRpcMethods<RpcConfigFor<PolkadotConfig>>;
 
+/// How far behind the head [`ChainClient::is_archive`] probes.
+///
+/// Just past Substrate's `--state-pruning 256` default, so a node running that default
+/// answers "pruned" rather than sitting on the boundary.
+const PRUNE_PROBE_DEPTH: u64 = 300;
+
 /// A connected chain: the subxt client, raw RPC access, and the chain's discovered identity.
 pub struct ChainClient {
     pub client: OnlineClient<PolkadotConfig>,
@@ -51,6 +57,31 @@ impl ChainClient {
 
         let info = discover(&rpc, &config.id).await?;
         Ok(Self { client, rpc, info })
+    }
+
+    /// Whether this endpoint still serves state for blocks well behind the head.
+    ///
+    /// There is no RPC that reports a node's pruning mode, so this asks the only question
+    /// that matters and reads the answer: resolve a block past the default pruning window
+    /// and see whether the node still has its state.
+    ///
+    /// The answer decides how far the fetch stage may run ahead of the digest. It is
+    /// deliberately biased towards `false` — on a chain shorter than the probe depth there
+    /// is nothing to distinguish, and the cost of guessing "pruned" is only that the fetcher
+    /// is held closer to the digest than it strictly needs to be. Guessing "archive" wrongly
+    /// costs the storage read cache the state it was going to be built from.
+    pub async fn is_archive(&self) -> Result<bool> {
+        let head = self.finalized_number().await?;
+        let Some(target) = head.checked_sub(PRUNE_PROBE_DEPTH) else {
+            return Ok(false);
+        };
+
+        match crate::decode::at_block(&self.client, &self.info, target).await {
+            Ok(_) => Ok(true),
+            Err(ChainError::PrunedState { .. }) => Ok(false),
+            // Anything else is a real failure and not evidence about pruning either way.
+            Err(e) => Err(e),
+        }
     }
 
     /// Number of the most recently finalized block.

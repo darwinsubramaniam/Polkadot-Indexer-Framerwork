@@ -1,18 +1,13 @@
 //! The hot store: a `u64 -> RawBlock` map on local disk, plus runtime metadata by version.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use parity_scale_codec::{Decode, Encode};
 
 use crate::error::{Result, StoreError};
 use crate::layout::{self, DEFAULT_SEGMENT_SIZE};
 use crate::raw::RawBlock;
-use crate::segment::{SegmentReader, SegmentWriter};
-
-/// zstd level. 3 is the library default and sits where the curve bends: most of the ratio,
-/// none of the CPU that would make the fetch stage compression-bound.
-const COMPRESSION_LEVEL: i32 = 3;
+use crate::segstore::Segments;
 
 /// A block archive on local disk.
 ///
@@ -24,26 +19,7 @@ const COMPRESSION_LEVEL: i32 = 3;
 /// and reads are one `pread`-shaped seek, so the calls are short enough to make an async
 /// wrapper more machinery than it buys.
 pub struct HotStore {
-    root: PathBuf,
-    segment_size: u64,
-    /// The segment currently being appended to. Held open so a sequential backfill is not
-    /// one `open(2)` per block.
-    writer: Mutex<Option<Active<SegmentWriter>>>,
-    /// The segment most recently read from. The digest walks blocks in order, so one slot
-    /// serves nearly every read.
-    reader: Mutex<Option<Active<SegmentReader>>>,
-}
-
-struct Active<T> {
-    chain: String,
-    index: u64,
-    inner: T,
-}
-
-impl<T> Active<T> {
-    fn matches(&self, chain: &str, index: u64) -> bool {
-        self.index == index && self.chain == chain
-    }
+    segments: Segments,
 }
 
 /// What a chain occupies on disk. Reported by `pif store status`.
@@ -60,17 +36,8 @@ impl HotStore {
     /// The root is created on demand: config validation deliberately does not require it to
     /// pre-exist, because the store appears on first run rather than being provisioned.
     pub fn open(path: impl Into<PathBuf>, segment_size: u64) -> Result<Self> {
-        if segment_size == 0 {
-            return Err(StoreError::InvalidSegmentSize);
-        }
-        let root = path.into();
-        std::fs::create_dir_all(&root).map_err(StoreError::io("creating store root", &root))?;
-
         Ok(Self {
-            root,
-            segment_size,
-            writer: Mutex::new(None),
-            reader: Mutex::new(None),
+            segments: Segments::new(path.into(), layout::BLOCKS, segment_size)?,
         })
     }
 
@@ -80,11 +47,11 @@ impl HotStore {
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        self.segments.root()
     }
 
     pub fn segment_size(&self) -> u64 {
-        self.segment_size
+        self.segments.segment_size()
     }
 
     /// Archive one block.
@@ -93,67 +60,30 @@ impl HotStore {
     /// advances `fetch_watermark`, which is what keeps Postgres from claiming a block the
     /// disk does not hold.
     pub fn put_block(&self, chain: &str, block: &RawBlock) -> Result<()> {
-        let index = layout::segment_index(block.number, self.segment_size);
-        let payload = zstd::stream::encode_all(block.encode().as_slice(), COMPRESSION_LEVEL)
-            .map_err(StoreError::io("compressing block", &self.root))?;
-
-        let mut slot = self.writer.lock().expect("store writer lock poisoned");
-        if !slot.as_ref().is_some_and(|w| w.matches(chain, index)) {
-            // Sealing here rather than on a timer: the previous segment is finished the
-            // moment the numbers move past it, and nothing else knows that.
-            if let Some(mut previous) = slot.take() {
-                previous.inner.sync()?;
-            }
-            let (seg, idx) = layout::segment_paths(&self.root, chain, index, self.segment_size)?;
-            let dir = seg.parent().expect("segment paths always have a parent");
-            std::fs::create_dir_all(dir)
-                .map_err(StoreError::io("creating blocks directory", dir))?;
-
-            *slot = Some(Active {
-                chain: chain.to_owned(),
-                index,
-                inner: SegmentWriter::open(&seg, &idx)?,
-            });
-        }
-
-        slot.as_mut()
-            .expect("just opened")
-            .inner
-            .append(block.number, &payload)
+        self.segments.put(chain, block.number, &block.encode())
     }
 
     /// Flush archived blocks to disk.
     pub fn sync(&self) -> Result<()> {
-        let mut slot = self.writer.lock().expect("store writer lock poisoned");
-        match slot.as_mut() {
-            Some(active) => active.inner.sync(),
-            None => Ok(()),
-        }
+        self.segments.sync()
     }
 
     /// Read one block back. `Ok(None)` means it was never archived.
     pub fn get_block(&self, chain: &str, number: u64) -> Result<Option<RawBlock>> {
-        let Some(payload) = self.read_payload(chain, number)? else {
+        let Some(payload) = self.segments.get(chain, number)? else {
             return Ok(None);
         };
 
-        let decompressed = zstd::stream::decode_all(payload.as_slice()).map_err(|source| {
+        let block = RawBlock::decode(&mut &payload[..]).map_err(|source| {
             StoreError::corrupt(
-                &self.root,
-                format!("block {number} did not decompress: {source}"),
-            )
-        })?;
-
-        let block = RawBlock::decode(&mut &decompressed[..]).map_err(|source| {
-            StoreError::corrupt(
-                &self.root,
+                self.root(),
                 format!("block {number} did not decode: {source}"),
             )
         })?;
 
         if block.number != number {
             return Err(StoreError::corrupt(
-                &self.root,
+                self.root(),
                 format!("segment holds block {} under key {number}", block.number),
             ));
         }
@@ -163,15 +93,7 @@ impl HotStore {
 
     /// Whether a block is archived, without paying to decompress it.
     pub fn has_block(&self, chain: &str, number: u64) -> Result<bool> {
-        let index = layout::segment_index(number, self.segment_size);
-        self.with_reader(chain, index, |reader| {
-            if reader.contains(number) {
-                return Ok(true);
-            }
-            reader.refresh()?;
-            Ok(reader.contains(number))
-        })
-        .map(|found| found.unwrap_or(false))
+        self.segments.has(chain, number)
     }
 
     /// Highest `n` such that every block in `from..=n` is archived.
@@ -182,35 +104,12 @@ impl HotStore {
     /// `fetch_watermark` against reality: Postgres records what was *reported* complete, the
     /// store knows what is actually *there*.
     pub fn contiguous_end(&self, chain: &str, from: u64) -> Result<Option<u64>> {
-        let mut last = None;
-        let mut number = from;
+        self.segments.contiguous_end(chain, from)
+    }
 
-        loop {
-            let index = layout::segment_index(number, self.segment_size);
-            let segment_end = layout::segment_end(index, self.segment_size);
-
-            let found = self.with_reader(chain, index, |reader| {
-                reader.refresh()?;
-                let mut n = number;
-                while n <= segment_end && reader.contains(n) {
-                    n += 1;
-                }
-                Ok(n)
-            })?;
-
-            // A missing segment file ends the run just as a missing block does.
-            let Some(next) = found else { return Ok(last) };
-            if next == number {
-                return Ok(last);
-            }
-
-            last = Some(next - 1);
-            number = next;
-
-            if number <= segment_end {
-                return Ok(last);
-            }
-        }
+    /// The lowest block number this chain has archived, if any.
+    pub fn first_block(&self, chain: &str) -> Result<Option<u64>> {
+        self.segments.first_number(chain)
     }
 
     /// Archive a runtime's metadata under its spec version.
@@ -220,7 +119,7 @@ impl HotStore {
     /// permanently undecodable even though the block bytes are intact — which is why it is
     /// worth the extra syscall.
     pub fn put_metadata(&self, chain: &str, spec_version: u32, scale: &[u8]) -> Result<()> {
-        let path = layout::metadata_path(&self.root, chain, spec_version)?;
+        let path = layout::metadata_path(self.root(), chain, spec_version)?;
         let dir = path.parent().expect("metadata paths always have a parent");
         std::fs::create_dir_all(dir).map_err(StoreError::io("creating metadata directory", dir))?;
 
@@ -232,7 +131,7 @@ impl HotStore {
 
     /// Read a runtime's archived metadata. `Ok(None)` means this version was never archived.
     pub fn get_metadata(&self, chain: &str, spec_version: u32) -> Result<Option<Vec<u8>>> {
-        let path = layout::metadata_path(&self.root, chain, spec_version)?;
+        let path = layout::metadata_path(self.root(), chain, spec_version)?;
         match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -246,7 +145,7 @@ impl HotStore {
 
     /// Spec versions with archived metadata, ascending.
     pub fn archived_runtimes(&self, chain: &str) -> Result<Vec<u32>> {
-        let dir = layout::meta_dir(&self.root, chain)?;
+        let dir = layout::meta_dir(self.root(), chain)?;
         let mut versions = Vec::new();
 
         let entries = match std::fs::read_dir(&dir) {
@@ -276,125 +175,14 @@ impl HotStore {
         Ok(versions)
     }
 
-    /// The lowest block number this chain has archived, if any.
-    ///
-    /// Found from the segment file names — which are the block range they cover — rather
-    /// than by scanning, because the layout puts that information in the path on purpose.
-    pub fn first_block(&self, chain: &str) -> Result<Option<u64>> {
-        let dir = layout::blocks_dir(&self.root, chain)?;
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(StoreError::Io {
-                    operation: "listing segments",
-                    path: dir,
-                    source,
-                });
-            }
-        };
-
-        let mut lowest_segment: Option<u64> = None;
-        for entry in entries {
-            let entry = entry.map_err(StoreError::io("listing segments", &dir))?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let Some(stem) = name.strip_suffix(".seg") else {
-                continue;
-            };
-            let Some((from, _)) = stem.split_once('-') else {
-                continue;
-            };
-            if let Ok(from) = from.parse::<u64>() {
-                let index = layout::segment_index(from, self.segment_size);
-                lowest_segment = Some(lowest_segment.map_or(index, |current| current.min(index)));
-            }
-        }
-
-        let Some(index) = lowest_segment else {
-            return Ok(None);
-        };
-
-        // The file names give the segment; only the index inside it knows which block in
-        // that range is actually the first, since a chain can start mid-segment.
-        Ok(self
-            .with_reader(chain, index, |reader| {
-                reader.refresh()?;
-                Ok(reader.numbers().next())
-            })?
-            .flatten())
-    }
-
     /// Bytes and segment counts for one chain.
     pub fn usage(&self, chain: &str) -> Result<StoreUsage> {
-        let mut usage = StoreUsage {
+        let usage = self.segments.usage(chain)?;
+        Ok(StoreUsage {
+            segments: usage.segments,
+            bytes: usage.bytes,
             runtimes: self.archived_runtimes(chain)?.len() as u64,
-            ..Default::default()
-        };
-
-        let dir = layout::blocks_dir(&self.root, chain)?;
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(usage),
-            Err(source) => {
-                return Err(StoreError::Io {
-                    operation: "listing segments",
-                    path: dir,
-                    source,
-                });
-            }
-        };
-
-        for entry in entries {
-            let entry = entry.map_err(StoreError::io("listing segments", &dir))?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".seg") {
-                usage.segments += 1;
-            }
-            if let Ok(meta) = entry.metadata() {
-                usage.bytes += meta.len();
-            }
-        }
-
-        Ok(usage)
-    }
-
-    fn read_payload(&self, chain: &str, number: u64) -> Result<Option<Vec<u8>>> {
-        let index = layout::segment_index(number, self.segment_size);
-        Ok(self
-            .with_reader(chain, index, |reader| reader.read(number))?
-            .flatten())
-    }
-
-    /// Run `f` against the reader for one segment, opening it if the cached slot holds a
-    /// different one. `Ok(None)` means the segment file does not exist.
-    fn with_reader<T>(
-        &self,
-        chain: &str,
-        index: u64,
-        f: impl FnOnce(&mut SegmentReader) -> Result<T>,
-    ) -> Result<Option<T>> {
-        let mut slot = self.reader.lock().expect("store reader lock poisoned");
-
-        if !slot.as_ref().is_some_and(|r| r.matches(chain, index)) {
-            let (seg, idx) = layout::segment_paths(&self.root, chain, index, self.segment_size)?;
-            match SegmentReader::open(&seg, &idx)? {
-                Some(reader) => {
-                    *slot = Some(Active {
-                        chain: chain.to_owned(),
-                        index,
-                        inner: reader,
-                    });
-                }
-                None => {
-                    *slot = None;
-                    return Ok(None);
-                }
-            }
-        }
-
-        f(&mut slot.as_mut().expect("just opened").inner).map(Some)
+        })
     }
 }
 
@@ -437,6 +225,28 @@ mod tests {
             );
         }
         assert_eq!(store.get_block("polkadot", 25).expect("get"), None);
+    }
+
+    #[test]
+    fn re_archiving_a_block_supersedes_the_old_record() {
+        // `pif fetch --from` over ground already held rewrites blocks the store has. A
+        // reader open on that segment must not keep serving what it read before.
+        let (_dir, store) = store();
+        store.put_block("polkadot", &sample(4)).expect("put");
+        assert_eq!(
+            store.get_block("polkadot", 4).expect("get"),
+            Some(sample(4))
+        );
+
+        let mut corrected = sample(4);
+        corrected.events = vec![0xff; 9];
+        store.put_block("polkadot", &corrected).expect("put again");
+
+        assert_eq!(
+            store.get_block("polkadot", 4).expect("get"),
+            Some(corrected),
+            "the second write must win, not the cached reader's first view"
+        );
     }
 
     #[test]

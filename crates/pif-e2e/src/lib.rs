@@ -4,6 +4,7 @@
 //! Networks are driven through the prebuilt `zombie-cli` binary and its `zombie.json` state
 //! file, so the only thing crossing that boundary is JSON.
 
+pub mod state_reader;
 pub mod zombienet;
 
 use std::path::{Path, PathBuf};

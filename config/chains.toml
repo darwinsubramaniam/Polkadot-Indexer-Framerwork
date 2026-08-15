@@ -32,12 +32,20 @@
 # them. That is what makes a re-index cost a re-*digest* rather than a re-download: adding a
 # handler, or fixing a decode bug, becomes `pif replay` over bytes already held.
 #
+# The archive holds two things, because a block archive is not a state archive. Handlers do
+# not read only blocks: `pallet_identity` emits `IdentitySet { who }` with no display name, so
+# the event says which key changed and only storage says what it changed to. Those storage
+# answers are archived alongside the blocks, keyed by the block they were read at, so a
+# replay needs no node either.
+#
 # Optional. Without this table every chain archives to `.pif-store` next to the config file,
 # which is what the defaults below say. A chain can override it with its own
 # `[chains.pipeline]` table.
 #
 # Sizing, so a disk can be bought before it is needed: Polkadot is ~28M blocks at roughly
-# 5-15 KB raw per block with events, so 200-400 GB uncompressed and 60-120 GB with zstd.
+# 5-15 KB raw per block with events, so 200-400 GB uncompressed and 60-120 GB with zstd. The
+# storage read cache for a state-heavy handler such as `identity` can exceed the blocks
+# themselves; budget for it separately.
 #
 # [pipeline]
 # hot_path = "/mnt/ssd/pif"
@@ -45,6 +53,15 @@
 # # number rather than looked up -- which means changing this on an existing store makes
 # # everything already written unfindable. Choose it once.
 # segment_size = 1000
+# # How far the fetch stage may run ahead of the digest, in blocks.
+# #
+# # Not a throughput knob. The storage read cache is filled on the FIRST digest of a block,
+# # from a node -- so a fetcher 100k blocks ahead means every one of those reads asks for
+# # state the node discarded long ago. Substrate defaults to `--state-pruning 256`.
+# #
+# # Omit to decide from the endpoint: an archive node gets no brake, anything else gets 256.
+# # Set it to bound how far the archive can grow ahead of Postgres regardless.
+# max_digest_lag = 100000
 
 [[chains]]
 # Stable key. Becomes the primary key in every table, so don't rename it casually.

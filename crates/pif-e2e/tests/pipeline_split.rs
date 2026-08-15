@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use pif_chain::{IndexOptions, pipeline};
 use pif_core::{ChainConfig, PipelineConfig};
+use pif_e2e::state_reader::StateReadingHandler;
 use pif_e2e::{database_url, dev_node_url};
 use sqlx::{PgPool, Row};
 
@@ -28,6 +29,11 @@ fn chain_config(id: &str, dir: &std::path::Path, handlers: Vec<String>) -> Chain
             // Deliberately tiny: the range above then spans three segment files, so segment
             // rollover is exercised rather than assumed.
             segment_size: 8,
+            // Probed from the endpoint. On this chain that resolves to 256 — it is too
+            // short for the probe to prove the node is archival — which is comfortably
+            // above the range below, so the brake never engages here. It is exercised
+            // deliberately in `the_fetch_stage_will_not_outrun_the_digest`.
+            max_digest_lag: None,
         })
 }
 
@@ -200,6 +206,7 @@ async fn a_replay_needs_no_network_at_all() -> Result<()> {
         ChainConfig::rpc(chain_id, "ws://127.0.0.1:1").with_pipeline(PipelineConfig {
             hot_path: dir.path().to_path_buf(),
             segment_size: 8,
+            max_digest_lag: None,
         });
 
     pipeline::replay(&pool, &unreachable, &pif_e2e::registry(), 0, LAST_BLOCK).await?;
@@ -209,6 +216,111 @@ async fn a_replay_needs_no_network_at_all() -> Result<()> {
         before,
         "a replay must reproduce exactly the rows the live run produced"
     );
+
+    Ok(())
+}
+
+/// The fetch stage must not run further ahead than the endpoint can still answer for.
+///
+/// The storage read cache is filled on the *first* digest of a block, from a node. A fetcher
+/// 100k blocks ahead means every one of those reads asks for state the node discarded long
+/// ago — Substrate defaults to `--state-pruning 256` — so the brake is not a throughput knob
+/// but the thing that keeps the cache fillable at all. It is also what stops the archive
+/// growing without bound when the digest stalls.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn the_fetch_stage_will_not_outrun_the_digest() -> Result<()> {
+    let pool = pool().await?;
+    let dir = tempfile::tempdir()?;
+    let chain_id = "e2e-max-lag";
+    reset(&pool, chain_id).await?;
+
+    const LAG: u64 = 5;
+    let config = ChainConfig::rpc(chain_id, dev_node_url()).with_pipeline(PipelineConfig {
+        hot_path: dir.path().to_path_buf(),
+        segment_size: 8,
+        max_digest_lag: Some(LAG),
+    });
+
+    // Fetch alone, with nothing digesting. It must archive up to the ceiling and then hold,
+    // rather than racing to `LAST_BLOCK` — so this is expected to time out, and a *clean
+    // finish* is the failure.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        pipeline::fetch_only(
+            &pool,
+            &config,
+            IndexOptions {
+                from: Some(0),
+                stop_at: Some(LAST_BLOCK),
+            },
+        ),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "fetch ran to completion with nothing digesting; the brake did not engage"
+    );
+
+    let marks = pif_db::repo::load_watermarks(&pool, chain_id)
+        .await?
+        .expect("watermarks");
+
+    // digest_watermark is -1 (nothing digested), so the ceiling is `-1 + LAG`.
+    let ceiling = LAG as i64 - 1;
+    assert!(
+        marks.fetch <= ceiling,
+        "fetch reached {} but the digest is at {}, which is past the ceiling of {ceiling}",
+        marks.fetch,
+        marks.digest
+    );
+    assert!(
+        marks.fetch >= 0,
+        "the brake should hold the fetcher, not stop it dead before it archives anything"
+    );
+
+    Ok(())
+}
+
+/// Both stages together must make progress under a brake tighter than the publish interval.
+///
+/// The regression test for a deadlock the brake introduced: the fetch stage publishes its
+/// watermark in batches, so with `max_digest_lag` below that batch size it would hold for a
+/// digest that was itself waiting for a watermark the fetcher had stopped moving. Each stage
+/// blocked on the other, and nothing in either loop timed out to reveal it.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn a_tight_brake_does_not_deadlock_the_two_stages() -> Result<()> {
+    let pool = pool().await?;
+    let dir = tempfile::tempdir()?;
+    let chain_id = "e2e-tight-brake";
+    reset(&pool, chain_id).await?;
+
+    // Well below the fetch stage's publish batch, which is where the deadlock lived.
+    let config = ChainConfig::rpc(chain_id, dev_node_url()).with_pipeline(PipelineConfig {
+        hot_path: dir.path().to_path_buf(),
+        segment_size: 8,
+        max_digest_lag: Some(3),
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        pipeline::run(
+            &pool,
+            &config,
+            &pif_e2e::registry(),
+            IndexOptions {
+                from: Some(0),
+                stop_at: Some(LAST_BLOCK),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("fetch and digest deadlocked under a tight max_digest_lag"))??;
+
+    assert_eq!(count_blocks(&pool, chain_id).await?, LAST_BLOCK as i64 + 1);
+    assert_eq!(pif_db::repo::count_gaps(&pool, chain_id).await?, 0);
 
     Ok(())
 }
@@ -274,6 +386,133 @@ async fn a_fetch_without_a_digest_resumes_cleanly() -> Result<()> {
         .await?
         .expect("watermarks");
     assert_eq!(marks.digest, LAST_BLOCK as i64);
+
+    Ok(())
+}
+
+/// A handler that reads chain **state** replays offline too.
+///
+/// This is the claim phase 2 exists to make good on, and the one phase 1 could not: blocks
+/// are in the archive, but `pallet_identity` emits `IdentitySet { who }` with no display
+/// name, so a handler asking *what* changed reaches for chain state — and state is not in a
+/// block. Unless the answers are archived as well, "replay" means "re-download" for every
+/// handler anyone actually writes.
+///
+/// So: index a range with a handler that reads storage on every block, then replay the same
+/// range with the node pointed at a dead address, and require the reads to come back
+/// identical.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn a_state_reading_handler_replays_with_no_network() -> Result<()> {
+    let pool = pool().await?;
+    let dir = tempfile::tempdir()?;
+    let chain_id = "e2e-state-replay";
+    reset(&pool, chain_id).await?;
+
+    let handlers = vec![StateReadingHandler::NAME.to_owned()];
+
+    // Live pass: every read misses the cache and goes to the node, which is what fills it.
+    let (handler, live_log) = StateReadingHandler::new();
+    let mut registry = pif_chain::HandlerRegistry::new();
+    registry.register(Box::new(handler));
+
+    pipeline::run(
+        &pool,
+        &chain_config(chain_id, dir.path(), handlers.clone()),
+        &registry,
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+
+    let live = live_log.lock().expect("read log").clone();
+    assert_eq!(
+        live.len() as u64,
+        (LAST_BLOCK + 1) * 2,
+        "the handler should have made two reads on every block"
+    );
+    assert!(
+        live.iter()
+            .any(|(_, _, answer)| answer.starts_with("some:")),
+        "every read came back empty, so this proves nothing about caching real answers"
+    );
+
+    // Replay against an address nothing is listening on. If any read still reached for the
+    // network this cannot pass — which is the entire point of asserting it this way rather
+    // than counting round-trips.
+    let (handler, replay_log) = StateReadingHandler::new();
+    let mut registry = pif_chain::HandlerRegistry::new();
+    registry.register(Box::new(handler));
+
+    let unreachable = ChainConfig::rpc(chain_id, "ws://127.0.0.1:1")
+        .with_handlers(handlers)
+        .with_pipeline(PipelineConfig {
+            hot_path: dir.path().to_path_buf(),
+            segment_size: 8,
+            max_digest_lag: None,
+        });
+
+    pipeline::replay(&pool, &unreachable, &registry, 0, LAST_BLOCK).await?;
+
+    let replayed = replay_log.lock().expect("read log").clone();
+    assert_eq!(
+        replayed, live,
+        "a replayed storage read must return exactly what the live read returned"
+    );
+
+    Ok(())
+}
+
+/// A read the archive never saw must stop the replay, not quietly fetch it.
+///
+/// The failure this guards against is the one that looks like success: a replay that falls
+/// back to the network is indistinguishable from a replay that worked, and nobody finds out
+/// until the bill arrives. So a miss is a named error naming the entry that was wanted.
+#[tokio::test]
+#[ignore = "requires a running dev node and Postgres"]
+async fn an_unarchived_storage_read_stops_a_replay_by_name() -> Result<()> {
+    let pool = pool().await?;
+    let dir = tempfile::tempdir()?;
+    let chain_id = "e2e-state-miss";
+    reset(&pool, chain_id).await?;
+
+    // Index with no handlers at all, so blocks are archived but no storage read ever is.
+    pipeline::run(
+        &pool,
+        &chain_config(chain_id, dir.path(), vec![]),
+        &pif_e2e::registry(),
+        IndexOptions {
+            from: Some(0),
+            stop_at: Some(LAST_BLOCK),
+        },
+    )
+    .await?;
+
+    // Now replay *with* a state-reading handler. Every read is a miss, and there is nothing
+    // to fall back to.
+    let (handler, _log) = StateReadingHandler::new();
+    let mut registry = pif_chain::HandlerRegistry::new();
+    registry.register(Box::new(handler));
+
+    let config = ChainConfig::rpc(chain_id, "ws://127.0.0.1:1")
+        .with_handlers(vec![StateReadingHandler::NAME.to_owned()])
+        .with_pipeline(PipelineConfig {
+            hot_path: dir.path().to_path_buf(),
+            segment_size: 8,
+            max_digest_lag: None,
+        });
+
+    let error = pipeline::replay(&pool, &config, &registry, 0, LAST_BLOCK)
+        .await
+        .expect_err("an unarchived read must not be answered from anywhere");
+
+    let text = error.to_string();
+    assert!(
+        text.contains("Timestamp.Now"),
+        "the error should name the read that was wanted, got: {text}"
+    );
 
     Ok(())
 }

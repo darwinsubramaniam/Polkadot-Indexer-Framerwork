@@ -32,9 +32,20 @@ pub fn segment_end(index: u64, segment_size: u64) -> u64 {
     segment_start(index, segment_size) + segment_size - 1
 }
 
-/// `<root>/<chain_id>/blocks`
-pub fn blocks_dir(root: &Path, chain: &str) -> Result<PathBuf> {
-    Ok(chain_dir(root, chain)?.join("blocks"))
+/// Archived blocks: `<root>/<chain_id>/blocks`.
+pub const BLOCKS: &str = "blocks";
+
+/// Archived answers to handler storage reads: `<root>/<chain_id>/storage`.
+///
+/// A sibling of [`BLOCKS`] rather than a second key shape inside it. The two are keyed the
+/// same way — by block number — which is what lets them share segment plumbing and, later,
+/// tier to cold storage together; but a block is one record and a block's storage reads are
+/// a set of them, so they are different stores holding different things.
+pub const STORAGE: &str = "storage";
+
+/// `<root>/<chain_id>/<kind>`
+pub fn segment_dir(root: &Path, chain: &str, kind: &str) -> Result<PathBuf> {
+    Ok(chain_dir(root, chain)?.join(kind))
 }
 
 /// `<root>/<chain_id>/meta`
@@ -51,10 +62,11 @@ pub fn metadata_path(root: &Path, chain: &str, spec_version: u32) -> Result<Path
 pub fn segment_paths(
     root: &Path,
     chain: &str,
+    kind: &str,
     index: u64,
     segment_size: u64,
 ) -> Result<(PathBuf, PathBuf)> {
-    let dir = blocks_dir(root, chain)?;
+    let dir = segment_dir(root, chain, kind)?;
     let stem = segment_stem(index, segment_size);
     Ok((
         dir.join(format!("{stem}.seg")),

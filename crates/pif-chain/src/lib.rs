@@ -5,6 +5,7 @@
 //! handlers ([`handlers`]) sit on top as an optional, per-chain projection layer.
 
 pub mod archive;
+pub mod cache;
 pub mod client;
 pub mod decode;
 pub mod digest;
@@ -17,8 +18,9 @@ pub mod metadata;
 pub mod pipeline;
 pub mod storage;
 
+pub use cache::CachedStorage;
 pub use client::ChainClient;
 pub use error::{ChainError, Result};
 pub use handlers::{BlockContext, EventHandler, HandlerRegistry};
 pub use pipeline::{IndexOptions, digest_only, fetch_only, replay, run, store_status};
-pub use storage::{OfflineStorage, StorageAt, SubxtStorage};
+pub use storage::{StorageAt, SubxtStorage};
