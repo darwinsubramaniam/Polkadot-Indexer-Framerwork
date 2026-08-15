@@ -9,8 +9,10 @@ pub mod decode;
 pub mod error;
 pub mod handlers;
 pub mod pipeline;
+pub mod storage;
 
 pub use client::ChainClient;
 pub use error::{ChainError, Result};
 pub use handlers::{BlockContext, EventHandler, HandlerRegistry};
 pub use pipeline::{IndexOptions, run};
+pub use storage::{StorageAt, SubxtStorage};

@@ -24,3 +24,18 @@ handlers = []
 # ws_url = "ws://127.0.0.1:9988"
 # start_block = 0
 # handlers = ["balances-transfer"]
+
+# The Polkadot People chain: identities, registrar judgements, sub-identities and usernames.
+# Requires building with `--features handler-identity`.
+#
+# NOTE: the handler reads chain *state*, not just events, because `pallet_identity`'s events
+# carry no payload (`IdentitySet { who }` has no display name). Storage reads at a historical
+# block need an ARCHIVE node -- the public endpoint below keeps only recent state, so set
+# `start_block` near the finalized head unless you have an archive endpoint. On first run the
+# handler sweeps `IdentityOf` once to seed everything that existed before `start_block`.
+#
+# [[chains]]
+# id = "polkadot-people"
+# ws_url = "wss://polkadot-people-rpc.polkadot.io"
+# start_block = 0
+# handlers = ["identity"]

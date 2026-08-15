@@ -1,0 +1,43 @@
+[package]
+name = "polkadot-indexer-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Identity and alias indexing for the Polkadot People chain, for the Polkadot Indexer Framework"
+repository = "https://github.com/darwinsubramaniam/polkadot-indexer-framework"
+homepage = "https://github.com/darwinsubramaniam/polkadot-indexer-framework"
+readme = "../../README.md"
+keywords = ["polkadot", "substrate", "indexer", "identity", "people"]
+categories = ["database"]
+
+[features]
+default = []
+# The GraphQL root. Off by default so a pipeline-only build does not pull async-graphql.
+api = ["dep:async-graphql", "dep:pif-api"]
+
+[lib]
+# Short import name: `use pif_identity::…`.
+name = "pif_identity"
+
+[dependencies]
+pif-core.workspace = true
+pif-db.workspace = true
+pif-chain.workspace = true
+pif-api = { workspace = true, optional = true }
+
+subxt.workspace = true
+scale-value.workspace = true
+parity-scale-codec.workspace = true
+
+sqlx.workspace = true
+bigdecimal.workspace = true
+async-graphql = { workspace = true, optional = true }
+async-trait.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

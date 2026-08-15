@@ -19,6 +19,7 @@ denormalised tables (`transfers`) for the queries that matter most.
 | `crates/pif-db` | `polkadot-indexer-db` | `pif_db` | Postgres persistence, migrations, repositories |
 | `crates/pif-chain` | `polkadot-indexer-chain` | `pif_chain` | subxt client, dynamic decoder, handler registry, pipeline |
 | `crates/pif-api` | `polkadot-indexer-api` | `pif_api` | extensible GraphQL schema + axum server |
+| `crates/pif-identity` | `polkadot-indexer-identity` | `pif_identity` | People-chain identities, usernames and the alias cross-check |
 | `crates/pif-cli` | `polkadot-indexer-cli` | — | reference binary, `pif` |
 | `crates/example` | *(unpublished)* | — | reference handler — **copy this to start your own** |
 
@@ -98,6 +99,7 @@ Both are **off by default**, so a plain build is just the indexing pipeline.
 |---|---|
 | `api` | the GraphQL server (`serve`). Pulls ~57 crates — async-graphql, axum — that the pipeline never needs, so it is opt-in. Running `serve` without it prints how to enable it. |
 | `handler-balances` | registers the reference handler from `crates/example`, populating a `transfers` table |
+| `handler-identity` | registers the `identity` handler for the Polkadot People chain: display names, registrar judgements, sub-identities and usernames. With `api`, also merges an `identity` GraphQL root into the schema. |
 
 ```sh
 cargo run -p polkadot-indexer-cli --features api -- serve              # GraphiQL on :8000
@@ -169,6 +171,88 @@ let schema = pif_api::build_schema_with(pool, Query::default());
 > `amount` and `fee` are returned as **strings**, not numbers — see the `u128` note below.
 > `limit` is capped at 100 server-side.
 
+## Aliases: who is behind a wallet
+
+`--features handler-identity` indexes the Polkadot People chain, which is where
+`pallet-identity` lives now — display names, registrar judgements, sub-identities, and
+usernames (`alice.dot`). The point is the **cross-check**: an indexer running against a
+*different* chain can ask whether a wallet has an alias, and whether anyone vouched for it.
+
+```toml
+[[chains]]
+id          = "polkadot-people"
+ws_url      = "wss://polkadot-people-rpc.polkadot.io"
+start_block = 0
+handlers    = ["identity"]
+```
+
+### This handler reads chain *state*, not just events
+
+`pallet_identity`'s events are notifications, not payloads: `IdentitySet { who }` carries no
+display name, and `JudgementGiven { target, registrar_index }` carries no judgement. So the
+events say **which account changed** and storage says **what it changed to**. That is why
+`BlockContext` now carries `storage: &dyn StorageAt`, and why the handler runs a one-off
+`bootstrap` sweep — everything set before your `start_block` is otherwise invisible, which on
+the People chain is nearly the entire identity set.
+
+> **Storage reads at a historical block need an archive node.** Tailing the finalized head
+> works against any node; backfilling does not, because a default node keeps only ~256 blocks
+> of state. You get `ChainError::PrunedState`, which says exactly this. Either point at an
+> archive endpoint or set `start_block` near the head.
+
+### Cross-checking from your own handler
+
+Both indexers write to the same Postgres and every table is keyed by `chain_id`, so a lookup
+from another chain is an ordinary join — no XCM correlation, no second connection:
+
+```rust
+use pif_identity::{IdentityResolver, PgIdentityResolver};
+
+// constructed with the chain that *holds* the identities, not the one you are indexing
+let identities = PgIdentityResolver::new(pool.clone(), "polkadot-people");
+
+let alias = identities.alias_of(&from_ss58).await?;
+if alias.as_ref().is_some_and(|a| a.verified) {
+    // a registrar vouched for this account
+}
+
+// and, because the table is temporal, as it stood at the time of the transfer
+let then = identities.alias_at(&from_ss58, block_number).await?;
+```
+
+Branch on `verified`, not on `display`: a display name only means somebody paid a deposit and
+typed something. Only `Reasonable` and `KnownGood` mean a registrar checked.
+
+A sub-identity has no identity of its own, so `effective_display` and `effective_verified`
+resolve up to the parent — a validator stash reads as its operator.
+
+### Without an indexer at all
+
+For a point lookup the RPC is enough, and that path ships too:
+
+```rust
+let resolver = pif_identity::RpcIdentityResolver::connect(&chain_config).await?;
+let alias = resolver.alias_of("5Grw...").await?;   // reads state at the finalized head
+```
+
+`alias_of` works with no database. `alias_at` returns `ResolveError::NotSupported`, because a
+node cannot know what an identity looked like last year — that is exactly what the index is
+for. Same trade-off, stated once:
+
+| Question | Needs |
+|---|---|
+| "Does this wallet have an alias **right now**?" | a node. No indexer. |
+| "Did it have one **at block N**?" | the indexer — historical state is pruned |
+| "Give me **every** verified account" | the indexer — a sweep per query is not a join |
+
+From the shell:
+
+```sh
+just alias polkadot-people 5Grw...   # display, username, verified, parent
+just identities polkadot-people      # verified accounts first
+just verified polkadot-people        # how many of them there are
+```
+
 ## Adding a chain
 
 Append to `config/chains.toml`. Nothing else changes:
@@ -185,6 +269,12 @@ Chain name, token symbol/decimals, SS58 prefix and genesis hash are read from th
 first connect and stored in the `chains` table.
 
 ## Design decisions worth knowing
+
+**Handlers can read chain state, not just events.** `BlockContext::storage` exposes the
+block's state through the same dynamic, metadata-driven path the decoder uses. It exists
+because some pallets report *that* something changed without reporting *what* — see the
+identity section above. It costs an RPC round-trip inside the block's transaction, so read
+only when an event says something changed.
 
 **Only finalized blocks are indexed.** `stream_blocks()` yields finalized blocks, which
 cannot be reverted, so there is no reorg-handling code and the stored chain can never contain

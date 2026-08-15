@@ -28,13 +28,16 @@ pub struct DecodedBlock {
     pub event_index: Vec<(u32, String, String)>,
 }
 
-/// Fetch and decode a single block.
-pub async fn decode_block(
+/// Resolve a block number to subxt's view of the chain at that block.
+///
+/// Separate from [`decode_block`] because state-reading callers (a handler's bootstrap sweep)
+/// need the block handle without paying to decode every extrinsic and event in it.
+pub async fn at_block(
     client: &OnlineClient<PolkadotConfig>,
     chain: &ChainInfo,
     number: u64,
-) -> Result<(AtBlock, BlockData)> {
-    let at = client.at_block(number).await.map_err(|source| {
+) -> Result<AtBlock> {
+    client.at_block(number).await.map_err(|source| {
         if is_pruned_state(&source) {
             ChainError::PrunedState {
                 chain: chain.id.clone(),
@@ -46,8 +49,16 @@ pub async fn decode_block(
                 source: Box::new(source),
             }
         }
-    })?;
+    })
+}
 
+/// Fetch and decode a single block.
+pub async fn decode_block(
+    client: &OnlineClient<PolkadotConfig>,
+    chain: &ChainInfo,
+    number: u64,
+) -> Result<(AtBlock, BlockData)> {
+    let at = at_block(client, chain, number).await?;
     let data = decode_at(&at, chain).await?;
     Ok((at, data))
 }
@@ -58,7 +69,7 @@ pub async fn decode_block(
 /// layers deep (subxt -> backend -> RPC -> client) by the time it surfaces, and the JSON-RPC
 /// code is not preserved through that chain. A false negative merely yields the original
 /// less-helpful error, so this is a safe heuristic.
-fn is_pruned_state(error: &dyn std::error::Error) -> bool {
+pub(crate) fn is_pruned_state(error: &dyn std::error::Error) -> bool {
     let text = error.to_string().to_lowercase();
     text.contains("state already discarded") || text.contains("unknown block")
 }

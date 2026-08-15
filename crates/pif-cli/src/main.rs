@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
 
         #[cfg(feature = "api")]
         Command::Serve { port } => {
-            let app = pif_api::router(pool);
+            let app = pif_api::router_with(build_schema(pool));
             let addr = format!("0.0.0.0:{port}");
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
@@ -163,6 +163,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The GraphQL schema this binary serves.
+///
+/// The companion to [`build_registry`]: a handler that owns tables usually wants to expose
+/// them, and the framework schema deliberately knows nothing about them. Merging a root here
+/// is how a project adds its own queries without forking `pif-api`.
+#[cfg(all(feature = "api", feature = "handler-identity"))]
+fn build_schema(
+    pool: sqlx::PgPool,
+) -> async_graphql::Schema<Query, async_graphql::EmptyMutation, async_graphql::EmptySubscription> {
+    pif_api::build_schema_with(pool, Query::default())
+}
+
+#[cfg(all(feature = "api", feature = "handler-identity"))]
+#[derive(async_graphql::MergedObject, Default)]
+struct Query(pif_api::CoreQuery, pif_identity::IdentityQuery);
+
+/// Without any table-owning handler there is nothing to merge, so this is the plain
+/// framework schema.
+#[cfg(all(feature = "api", not(feature = "handler-identity")))]
+fn build_schema(pool: sqlx::PgPool) -> pif_api::IndexerSchema {
+    pif_api::build_schema(pool)
+}
+
 /// Every handler this binary knows about.
 ///
 /// This is the whole extension seam. A downstream indexer (`hydration-indexer`, say) writes
@@ -174,6 +197,9 @@ fn build_registry() -> pif_chain::HandlerRegistry {
 
     #[cfg(feature = "handler-balances")]
     registry.register(Box::new(pif_example_balances::BalancesTransferHandler));
+
+    #[cfg(feature = "handler-identity")]
+    registry.register(Box::new(pif_identity::IdentityHandler));
 
     registry
 }

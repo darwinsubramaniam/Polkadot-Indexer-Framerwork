@@ -1,0 +1,103 @@
+# Relay + Asset Hub + People, for exercising the alias cross-check end to end:
+# transfers happen on the hub, identities are set on People, and the indexer joins them in
+# one Postgres.
+#
+#   just zn-up      # spawn
+#   just zn-down    # tear down
+#
+# ---------------------------------------------------------------------------------------
+# Why every node here authors alone
+# ---------------------------------------------------------------------------------------
+#
+# On Apple Silicon the node images are linux/amd64 only, and under emulation the libp2p
+# Noise handshake fails to authenticate:
+#
+#   ERROR litep2p::crypto::noise: failed to decrypt message ty=WebSocket
+#         buf_len=1876 frame_size=1892 error=Decrypt
+#
+# The 16-byte gap is the Poly1305 tag, so frames arrive but do not authenticate. No two
+# nodes in this network can peer, and that is not fixable from config here.
+#
+# It does not need to be, because nothing in this network requires a peer:
+#
+#   * the relay runs a SINGLE validator, so it authors and finalizes alone;
+#   * each collator gets `--dev-block-time`, so it authors its own blocks on a timer
+#     instead of waiting for relay-provided parent data.
+#
+# WHAT THIS IS NOT: the parachains are registered on the relay, but their blocks are never
+# backed or included there -- no collator can send a collation without p2p. So there is no
+# shared security, no relay-driven finality, and NO XCM. Treat this as three independent
+# chains that zombienet happens to start together.
+#
+# That is enough for the alias cross-check, which is a Postgres join keyed by `chain_id` and
+# involves no XCM at all. It is NOT enough for anything testing real parachain consensus or
+# cross-chain messaging -- for that, run this on Linux x86_64 with `--provider native` and
+# released binaries, where neither emulation nor container port mapping applies.
+
+[settings]
+# Generous: every node image runs under emulation, and building the two parachain raw chain
+# specs alone takes a couple of minutes.
+timeout = 1200
+
+[relaychain]
+chain = "westend-local"
+default_image = "parity/polkadot:stable2606"
+default_command = "polkadot"
+default_args = ["--no-telemetry"]
+
+  [[relaychain.nodes]]
+  name = "alice"
+  validator = true
+  # Pinned so the indexer's `config/chains.toml` can name a stable endpoint. Without this
+  # the docker provider assigns a random host port on every spawn.
+  rpc_port = 9944
+  p2p_port = 30333
+  # zombienet's default (~2e12) is not enough for the transfer amounts the demo uses.
+  initial_balance = 1000000000000000000
+
+[[parachains]]
+id = 1000
+chain = "asset-hub-westend-local"
+
+  [parachains.collator]
+  name = "hub"
+  image = "parity/polkadot-parachain:stable2606"
+  command = "polkadot-parachain"
+  rpc_port = 9946
+  args = [
+    "--dev-block-time=1000",
+    "--no-telemetry",
+    # The identity handler reads storage AT each indexed block, and the indexer backfills
+    # from genesis. Default pruning keeps 256 blocks, which at one block per second is
+    # gone in four minutes -- after that, indexing fails with `PrunedState`.
+    "--state-pruning=archive",
+    "--blocks-pruning=archive",
+  ]
+
+[[parachains]]
+id = 1004
+chain = "people-westend-local"
+# Installs Alice as identity registrar #0 at genesis.
+#
+# `Identity::add_registrar` needs a root origin, and the People chain has no `Sudo` pallet --
+# on a real network that origin arrives from the relay as an XCM `Transact`, which this
+# network cannot deliver (its parachains are never backed, so no DMP reaches them).
+# `pallet_identity` has no `GenesisConfig` for registrars either, so the runtime-genesis
+# patch cannot express it.
+#
+# `raw_spec_override` deep-merges JSON into the *raw* chain spec, which is a map of hex
+# storage key to hex value -- so writing `Identity::Registrars` directly is the way in.
+# Regenerate with `just gen-registrar` (key and value both come from live metadata).
+raw_spec_override = "crates/pif-e2e/networks/people-registrar.json"
+
+  [parachains.collator]
+  name = "people"
+  image = "parity/polkadot-parachain:stable2606"
+  command = "polkadot-parachain"
+  rpc_port = 9955
+  args = [
+    "--dev-block-time=1000",
+    "--no-telemetry",
+    "--state-pruning=archive",
+    "--blocks-pruning=archive",
+  ]

@@ -10,6 +10,7 @@ use crate::client::ChainClient;
 use crate::decode;
 use crate::error::{ChainError, Result};
 use crate::handlers::{BlockContext, HandlerRegistry, Selected};
+use crate::storage::SubxtStorage;
 
 /// How long to wait before reconnecting after the block stream drops.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -64,6 +65,21 @@ pub async fn run(
             None => config.start_block,
         },
     };
+
+    // Seed handlers that project chain *state* before any block is indexed.
+    //
+    // Taken at the block *before* the first one we index, so the snapshot represents
+    // everything that happened while we were not watching, and the block loop then applies
+    // changes on top without double-counting the first block. `saturating_sub` makes
+    // `start_block = 0` snapshot genesis, which is empty — correct, and cheap.
+    if !handlers.is_empty() {
+        let snapshot_at = start.saturating_sub(1);
+        let at = decode::at_block(&chain.client, &chain.info, snapshot_at).await?;
+        let storage = SubxtStorage::new(&at, &chain.info.id);
+
+        tracing::info!(chain = %config.id, block = snapshot_at, "bootstrapping handlers");
+        handlers.bootstrap(&chain.info, &storage, pool).await?;
+    }
 
     let target = chain.finalized_number().await?;
     tracing::info!(chain = %config.id, start, finalized_head = target, "starting catch-up");
@@ -168,12 +184,18 @@ async fn persist(
     spec_name: &str,
     number: u64,
 ) -> Result<()> {
-    let (_at, mut data) = decode::decode_block(&chain.client, &chain.info, number).await?;
+    let (at, mut data) = decode::decode_block(&chain.client, &chain.info, number).await?;
     data.spec_name = spec_name.to_owned();
+
+    // State at this exact block, for handlers whose pallet reports *that* something changed
+    // without reporting *what* it changed to.
+    let storage = SubxtStorage::new(&at, &chain.info.id);
 
     let ctx = BlockContext {
         chain: &chain.info,
         block_number: number,
+        block_hash: &data.block.hash,
+        storage: &storage,
     };
 
     let mut tx = pool.begin().await?;

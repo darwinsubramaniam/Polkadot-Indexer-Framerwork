@@ -2849,6 +2849,9 @@ dependencies = [
  "polkadot-indexer-chain",
  "polkadot-indexer-core",
  "polkadot-indexer-db",
+ "polkadot-indexer-identity",
+ "scale-info",
+ "scale-value",
  "serde",
  "serde_json",
  "sqlx",
@@ -2977,6 +2980,7 @@ name = "polkadot-indexer-cli"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-graphql",
  "axum",
  "clap",
  "pif-example-balances",
@@ -2984,6 +2988,7 @@ dependencies = [
  "polkadot-indexer-chain",
  "polkadot-indexer-core",
  "polkadot-indexer-db",
+ "polkadot-indexer-identity",
  "sqlx",
  "tokio",
  "tracing",
@@ -3016,6 +3021,29 @@ dependencies = [
  "serde_json",
  "sqlx",
  "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
+name = "polkadot-indexer-identity"
+version = "1.0.0"
+dependencies = [
+ "async-graphql",
+ "async-trait",
+ "bigdecimal",
+ "futures",
+ "hex",
+ "parity-scale-codec",
+ "polkadot-indexer-api",
+ "polkadot-indexer-chain",
+ "polkadot-indexer-core",
+ "polkadot-indexer-db",
+ "scale-value",
+ "serde_json",
+ "sqlx",
+ "subxt",
+ "thiserror 2.0.20",
+ "tokio",
  "tracing",
 ]
 

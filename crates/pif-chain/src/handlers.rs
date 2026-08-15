@@ -19,14 +19,27 @@
 use async_trait::async_trait;
 use pif_core::ChainInfo;
 use pif_db::BlockData;
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 
 use crate::error::{ChainError, Result};
+use crate::storage::StorageAt;
 
 /// Context for a single block being handled.
 pub struct BlockContext<'a> {
     pub chain: &'a ChainInfo,
     pub block_number: u64,
+    /// This block's hash, as stored on the `blocks` row.
+    pub block_hash: &'a [u8],
+    /// Chain state *at this block*.
+    ///
+    /// Some pallets do not put what changed into the event — `pallet_identity` emits
+    /// `IdentitySet { who }` with no display name — so the event says which key changed and
+    /// only storage says what it changed to. Reads here are made at this block's hash, so a
+    /// handler sees exactly the state the block left behind.
+    ///
+    /// This costs an RPC round-trip inside the block's transaction, so read only when an
+    /// event tells you something actually changed.
+    pub storage: &'a dyn StorageAt,
 }
 
 /// Derives extra tables from a block's decoded events.
@@ -48,6 +61,29 @@ pub trait EventHandler: Send + Sync {
     /// coordinated with the framework or with other handlers.
     fn migrator(&self) -> Option<&'static sqlx::migrate::Migrator> {
         None
+    }
+
+    /// Seed state once, before any block is indexed.
+    ///
+    /// Runs after migrations and **outside** any block transaction, with storage at the block
+    /// before the first one to be indexed. Two things make this necessary rather than
+    /// optional for a state-backed handler:
+    ///
+    ///   * events only describe changes, so anything set *before* the start block is
+    ///     invisible — on the People chain that is nearly the whole identity set, which
+    ///     arrived by migration rather than through blocks we index;
+    ///   * a full storage sweep is tens of thousands of keys, which must not happen inside
+    ///     the one-transaction-per-block path.
+    ///
+    /// Implementations must be idempotent: this may run again after a crash. Default is a
+    /// no-op, so event-only handlers are unaffected.
+    async fn bootstrap(
+        &self,
+        _chain: &ChainInfo,
+        _storage: &dyn StorageAt,
+        _pool: &PgPool,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Derive and persist rows for one block.
@@ -127,6 +163,29 @@ pub struct Selected<'a> {
 impl Selected<'_> {
     pub fn is_empty(&self) -> bool {
         self.handlers.is_empty()
+    }
+
+    /// Seed every enabled handler, once, before the block loop starts.
+    ///
+    /// Sequential rather than concurrent: a bootstrap sweep is RPC-bound against a single
+    /// node, so running several at once buys nothing and makes the failure ordering harder
+    /// to reason about.
+    pub async fn bootstrap(
+        &self,
+        chain: &ChainInfo,
+        storage: &dyn StorageAt,
+        pool: &PgPool,
+    ) -> Result<()> {
+        for handler in &self.handlers {
+            handler.bootstrap(chain, storage, pool).await.map_err(|e| {
+                tracing::error!(
+                    handler = handler.name(), chain = %chain.id, error = %e,
+                    "handler bootstrap failed; refusing to index with incomplete state"
+                );
+                e
+            })?;
+        }
+        Ok(())
     }
 
     /// Run every enabled handler over a decoded block, inside the block's transaction.

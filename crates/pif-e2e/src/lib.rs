@@ -45,5 +45,8 @@ pub fn registry() -> pif_chain::HandlerRegistry {
     #[cfg(feature = "handler-balances")]
     registry.register(Box::new(pif_example_balances::BalancesTransferHandler));
 
+    #[cfg(feature = "handler-identity")]
+    registry.register(Box::new(pif_identity::IdentityHandler));
+
     registry
 }

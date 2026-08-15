@@ -4,6 +4,9 @@
 # Fetched by scripts/fetch-zombie-cli.sh — a 40MB prebuilt binary, not source.
 /bin/
 
+# Spawned network state from `just zn-up`.
+/.zombienet/
+
 # Local environment overrides
 .env
 

@@ -132,24 +132,10 @@ fn extract(fields: &Json, ss58_prefix: u16) -> Option<(String, String, BigDecima
 
 /// Render a decoded account field as SS58.
 ///
-/// `AccountId32` is a newtype around `[u8; 32]`, so the codec yields a one-element array
-/// wrapping the hex string rather than a bare string. That extra level is not unwrapped
-/// globally — newtypes and one-element `Vec`s are indistinguishable after SCALE decoding,
-/// so unwrapping everywhere would silently turn single-element lists into scalars. Here the
-/// field is known to be an account, so it is safe to unwrap.
+/// Every typed handler needs the same `AccountId32`-newtype unwrapping, so the logic lives in
+/// [`pif_core::ss58::decode_account`]; this is just the local name for it.
 fn account_to_ss58(value: &Json, ss58_prefix: u16) -> Option<String> {
-    let hex_str = match value {
-        Json::String(s) => s.as_str(),
-        Json::Array(items) if items.len() == 1 => items[0].as_str()?,
-        _ => return None,
-    };
-
-    let bytes = hex::decode(hex_str.strip_prefix("0x")?).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-
-    Some(pif_core::ss58::encode(&bytes, ss58_prefix))
+    pif_core::ss58::decode_account(value, ss58_prefix)
 }
 
 #[cfg(test)]

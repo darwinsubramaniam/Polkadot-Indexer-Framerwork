@@ -40,6 +40,20 @@ pub enum ChainError {
     )]
     PrunedState { chain: String, number: u64 },
 
+    /// A storage read at a block failed for a reason other than pruning.
+    ///
+    /// Named separately from [`ChainError::Decode`] because the pallet and entry are what
+    /// identify the problem — a renamed storage item after a runtime upgrade looks nothing
+    /// like a malformed block, and reporting it as "failed to decode block N" hides that.
+    #[error("failed to read storage {pallet}.{entry} at block {number}")]
+    StorageRead {
+        pallet: String,
+        entry: String,
+        number: u64,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[error("failed to decode block {number}")]
     Decode {
         number: u64,

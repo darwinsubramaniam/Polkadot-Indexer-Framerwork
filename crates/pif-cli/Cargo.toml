@@ -19,11 +19,15 @@ default = []
 
 # The GraphQL API. Off by default: async-graphql + axum pull in ~59 crates that the
 # indexing pipeline itself never needs, and plenty of deployments query Postgres directly.
-api = ["dep:pif-api", "dep:axum"]
+api = ["dep:pif-api", "dep:axum", "dep:async-graphql", "pif-identity?/api"]
 
 # Registers the reference handler so the stock binary demonstrates the overlay. A real
 # downstream project registers its own instead.
 handler-balances = ["dep:pif-example-balances"]
+
+# Identity / alias indexing for the Polkadot People chain. Adds the `identity` handler and,
+# together with `api`, an `identity` GraphQL root merged into the framework schema.
+handler-identity = ["dep:pif-identity"]
 
 [dependencies]
 pif-core.workspace = true
@@ -31,7 +35,9 @@ pif-db.workspace = true
 pif-chain.workspace = true
 pif-api = { workspace = true, optional = true }
 pif-example-balances = { workspace = true, optional = true }
+pif-identity = { workspace = true, optional = true }
 
+async-graphql = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 clap.workspace = true
 tokio.workspace = true

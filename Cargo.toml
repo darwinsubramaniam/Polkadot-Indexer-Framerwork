@@ -15,6 +15,7 @@ pif-core = { path = "crates/pif-core", package = "polkadot-indexer-core", versio
 pif-db = { path = "crates/pif-db", package = "polkadot-indexer-db", version = "1.0.0" }
 pif-chain = { path = "crates/pif-chain", package = "polkadot-indexer-chain", version = "1.0.0" }
 pif-api = { path = "crates/pif-api", package = "polkadot-indexer-api", version = "1.0.0" }
+pif-identity = { path = "crates/pif-identity", package = "polkadot-indexer-identity", version = "1.0.0" }
 # Reference handler. Unpublished — downstream projects copy it rather than depend on it.
 pif-example-balances = { path = "crates/example" }
 

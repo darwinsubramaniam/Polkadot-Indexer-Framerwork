@@ -23,10 +23,12 @@ publish = false
 default = []
 # Mirrors the indexer-chain feature so the typed-overlay test can be enabled.
 handler-balances = ["dep:pif-example-balances"]
+handler-identity = ["dep:pif-identity"]
 
 [dependencies]
 pif-chain.workspace = true
 pif-example-balances = { workspace = true, optional = true }
+pif-identity = { workspace = true, optional = true }
 anyhow.workspace = true
 serde_json.workspace = true
 
@@ -36,6 +38,8 @@ pif-db.workspace = true
 
 subxt.workspace = true
 subxt-signer.workspace = true
+scale-value.workspace = true
+scale-info = "2.11"
 sqlx.workspace = true
 tokio.workspace = true
 futures.workspace = true

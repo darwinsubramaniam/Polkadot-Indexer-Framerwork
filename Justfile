@@ -12,7 +12,7 @@ DATABASE_URL := env_var_or_default("DATABASE_URL", "postgres://indexer:indexer@l
 PSQL := "PGPASSWORD=indexer psql -h localhost -p 5433 -U indexer -d substrate_indexer"
 
 # All features that exist, for the "everything on" recipes.
-ALL := "--features api,handler-balances"
+ALL := "--features api,handler-balances,handler-identity"
 
 default:
     @just --list --unsorted
@@ -90,6 +90,49 @@ transfers CHAIN:
     @{{PSQL}} -c "SELECT block_number, event_idx, from_address, to_address, amount \
         FROM transfers WHERE chain_id = '{{CHAIN}}' ORDER BY block_number DESC LIMIT 20;"
 
+# Regenerate the genesis override that makes Alice identity registrar #0 on People.
+# Needs a People node running; derives both key and value from live metadata.
+gen-registrar:
+    cargo test -p pif-e2e --features handler-identity \
+        --test gen_registrar_override -- --ignored --nocapture
+
+# Spawn the three-chain demo network: relay + Asset Hub + People.
+#
+# Slow: the node images are linux/amd64 and run under emulation, and zombienet has to build
+# a raw chain spec for each parachain first. Budget ~5 minutes.
+zn-up:
+    @mkdir -p .zombienet
+    bin/zombie-cli spawn "$PWD/crates/pif-e2e/networks/three-chain.toml" \
+        --provider docker --dir "$PWD/.zombienet/out"
+
+# Tear the demo network down.
+zn-down:
+    -pkill -f "zombie-cli spawn" 2>/dev/null || true
+    -docker ps --format '{{{{.Names}}}}' | grep -i zombie | xargs -r docker rm -f
+    -rm -rf .zombienet
+
+# The alias cross-check end to end: transfers on the hub, identities on People, one join.
+zn-alias-demo:
+    cargo test -p pif-e2e --features handler-balances,handler-identity \
+        --test three_chain_alias -- --ignored --nocapture
+
+# Identities indexed for a chain, most recently changed first.
+identities CHAIN:
+    @{{PSQL}} -c "SELECT account, effective_display AS display, username, effective_verified AS verified \
+        FROM identity_current WHERE chain_id = '{{CHAIN}}' \
+        ORDER BY effective_verified DESC, account LIMIT 20;"
+
+# Everything known about one wallet's alias -- the cross-check, from the shell.
+alias CHAIN ACCOUNT:
+    @{{PSQL}} -c "SELECT account, effective_display AS display, username, \
+        effective_verified AS verified, super_account, sub_label, judgements \
+        FROM identity_current WHERE chain_id = '{{CHAIN}}' AND account = '{{ACCOUNT}}';"
+
+# How many accounts carry a registrar-vouched identity.
+verified CHAIN:
+    @{{PSQL}} -c "SELECT count(*) FILTER (WHERE effective_verified) AS verified, count(*) AS total \
+        FROM identity_current WHERE chain_id = '{{CHAIN}}';"
+
 # The same transfers as the dynamic core stored them (works without handler-balances).
 transfer-events CHAIN:
     @{{PSQL}} -c "SELECT block_number, idx, fields FROM events \
@@ -148,6 +191,7 @@ lint:
     cargo fmt --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo clippy --workspace --all-targets --features api -- -D warnings
+    cargo clippy --workspace --all-targets --features handler-identity -- -D warnings
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # What CI should run.
