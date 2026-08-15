@@ -116,6 +116,27 @@ zn-down:
     -docker ps --format '{{{{.Names}}}}' | grep -i zombie | xargs -r docker rm -f
     -rm -rf .zombienet
 
+# Spawn the runtime-upgrade-boundary network: ONE relay node on a deliberately old release.
+#
+# Fast compared to `zn-up` (one node, no parachain specs to build): ~40 seconds. Coexists
+# with the three-chain network -- it binds 9977, not 9944.
+zn-upgrade-up:
+    @mkdir -p .zombienet
+    ./scripts/fetch-westend-runtime.sh
+    bin/zombie-cli spawn "$PWD/crates/pif-e2e/networks/upgrade-boundary.toml" \
+        --provider docker --dir "$PWD/.zombienet/upgrade-out"
+
+# The runtime-upgrade boundary test (IPD-002 §9.1.2).
+#
+# Needs a FRESH network every run: the test upgrades the chain, so a second run against the
+# same one has nothing left to upgrade to. `zn-upgrade-up` first, every time.
+test-upgrade-boundary:
+    cargo test -p pif-e2e --test upgrade_boundary -- --ignored --nocapture
+
+# The offline-decode spike (IPD-002 §9.1.1). Runs against any chain; 9944 by default.
+test-offline-decode:
+    cargo test -p pif-e2e --test decode_stored_spike -- --ignored --nocapture
+
 # The alias cross-check end to end: transfers on the hub, identities on People, one join.
 zn-alias-demo:
     cargo test -p pif-e2e --features handler-balances,handler-identity \

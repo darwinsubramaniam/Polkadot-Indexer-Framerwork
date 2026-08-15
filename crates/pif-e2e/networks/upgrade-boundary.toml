@@ -1,0 +1,57 @@
+# A single westend-local validator on a DELIBERATELY OLD release, so a test can upgrade it
+# forward and produce a real `spec_version` boundary in the block history.
+#
+#   just zn-upgrade-up      # spawn
+#   just zn-upgrade-down    # tear down
+#
+# ---------------------------------------------------------------------------------------
+# Why an old image
+# ---------------------------------------------------------------------------------------
+#
+# IPD-002 §9.1.1's offline-decode spike covered one runtime only. The gap it left is the
+# case where an archived block range spans a runtime upgrade: metadata is archived per
+# `spec_version`, and nothing yet proves the digest picks the right one per block.
+#
+# Producing that boundary needs two runtimes of the SAME chain with DIFFERENT spec versions.
+# The `parity/polkadot:stable2606` image the rest of the suite uses is already at westend
+# `spec_version = 1024001`, which is the newest published — there is nothing to upgrade *to*.
+# So this network starts one release behind, at stable2603 (`spec_version = 1022002`), and
+# the test upgrades it to 1024001 using the runtime wasm published as a polkadot-sdk release
+# asset (`scripts/fetch-westend-runtime.sh`).
+#
+# Upgrading FORWARD matters. `set_code_without_checks` would also accept an older runtime,
+# but runtime storage migrations only run in one direction — a downgrade is not a supported
+# operation and would be testing something no real chain ever does.
+#
+# ---------------------------------------------------------------------------------------
+# Why one node
+# ---------------------------------------------------------------------------------------
+#
+# Same reason as `three-chain.toml`: on Apple Silicon these images are linux/amd64 and the
+# libp2p Noise handshake fails under emulation, so no two nodes can peer. A single validator
+# authors and finalizes alone, which is all this test needs.
+
+[settings]
+timeout = 1200
+
+[relaychain]
+chain = "westend-local"
+# One release behind the rest of the suite, ON PURPOSE. See above.
+default_image = "parity/polkadot:stable2603"
+default_command = "polkadot"
+default_args = ["--no-telemetry"]
+
+  [[relaychain.nodes]]
+  name = "alice"
+  validator = true
+  # Deliberately not 9944/9946/9955 — this network is meant to coexist with the
+  # three-chain one rather than replace it.
+  rpc_port = 9977
+  p2p_port = 30343
+  # The test archives blocks either side of the upgrade and decodes them afterwards, so
+  # no block or state it touches may be pruned out from under it.
+  args = [
+    "--no-telemetry",
+    "--state-pruning=archive",
+    "--blocks-pruning=archive",
+  ]

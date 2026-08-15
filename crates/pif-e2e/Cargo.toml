@@ -40,6 +40,7 @@ pif-db.workspace = true
 subxt.workspace = true
 subxt-signer.workspace = true
 scale-value.workspace = true
+parity-scale-codec.workspace = true
 scale-info = "2.11"
 sqlx.workspace = true
 tokio.workspace = true
