@@ -559,8 +559,8 @@ Stated so the next person does not over-read it:
 >
 > **Status: fixed in `543a56f`**, shipped on its own without any other part of this proposal.
 > The section is kept in full because the reasoning is what stops the same mistake being made
-> again — in the fetch stage, in the archive, or in the `runtime_upgrades` table (§9.4.6),
-> each of which has to make the identical parent-versus-block choice.
+> again — in the fetch stage, in the archive, or in `runtime_versions.first_seen_block`
+> (§9.4.6), each of which has to make the identical parent-versus-block choice.
 
 Closing §9.1.1's "one runtime" gap meant performing a real forward runtime upgrade
 (westend `1022002 → 1024001`) and archiving blocks either side of it. The first attempt did
@@ -727,9 +727,8 @@ CREATE INDEX fetch_chunks_claimable_idx ON fetch_chunks (chain_id, from_block)
 CREATE INDEX fetch_chunks_expiry_idx ON fetch_chunks (lease_expires_at)
     WHERE state = 'leased';
 
--- Which runtime executed which blocks. Defined in §9.4.6, listed here because it lands in
--- the same migration.
---   ... see `runtime_upgrades` in §9.4.6
+-- NOTE: the same migration also ALTERs the existing `runtime_versions` table rather than
+-- adding a table for archived metadata — see §9.4.6 for why a second one would be wrong.
 
 -- Which tier a segment is on, and whether it is intact. NOT a lookup index:
 -- the hot path is computed from the block number (§9.1).
@@ -1024,7 +1023,7 @@ flowchart TD
     C --> D{"Metadata::decode_from<br/>succeeds?"}
     D -- no --> E["ChainError::UnsupportedMetadataVersion<br/>HALT this chain + alert"]
     D -- yes --> F["write meta/&lt;spec&gt;.scale<br/>fsync + checksum"]
-    F --> G["INSERT runtime_upgrades row<br/>(spec, first_block, format, hash)"]
+    F --> G["fill runtime_versions columns<br/>(format, hash, tx_version)"]
     G --> H["diff handler-relevant pallets<br/>against previous spec"]
     H -- unchanged --> I["log at info, carry on"]
     H -- changed --> J["WARN: handler drift<br/>chain keeps indexing"]
@@ -1040,26 +1039,69 @@ Block N decodes with the old runtime, N+1 onward with the new, and the watermark
 backwards.
 
 **The boundary gets recorded**, so the archive is self-describing and a replay never has to
-re-derive the block → runtime map from a node it may no longer have:
+re-derive the block → runtime map from a node it may no longer have.
+
+**This needs no new table.** An earlier draft of this proposal invented `runtime_upgrades`,
+which was a mistake: `runtime_versions` already exists (`migrations/0001_core.sql:25`), with
+the *same* primary key and the *same* grain — one row per `(chain_id, spec_version)`.
 
 ```sql
--- Which runtime executed which blocks, and where its metadata came from.
-CREATE TABLE runtime_upgrades (
-    chain_id         TEXT   NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
-    spec_version     BIGINT NOT NULL,
-    first_block      BIGINT NOT NULL,        -- first block EXECUTED by this runtime
-    metadata_version SMALLINT NOT NULL,      -- 14 | 15 | 16 — which format was archived (§9.4.3.1)
-    metadata_hash    BYTEA  NOT NULL,
-    spec_name        TEXT   NOT NULL,
-    seen_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+-- migrations/0001_core.sql:25 — already shipped, already maintained.
+CREATE TABLE runtime_versions (
+    chain_id         TEXT    NOT NULL REFERENCES chains(id) ON DELETE CASCADE,
+    spec_version     INTEGER NOT NULL,
+    spec_name        TEXT    NOT NULL,
+    first_seen_block BIGINT  NOT NULL,
     PRIMARY KEY (chain_id, spec_version)
 );
 ```
 
+Two tables at the same grain would have to agree about which block a runtime started at, and
+the day they disagreed the archive would be the one that was wrong. So `0002_pipeline.sql`
+**extends** it rather than shadowing it:
+
+```sql
+-- What the archive knows about each runtime, beyond the fact that it existed.
+ALTER TABLE runtime_versions
+    ADD COLUMN transaction_version INTEGER,     -- with spec_version, what OfflineClient::at_block needs
+    ADD COLUMN metadata_version    SMALLINT,    -- 14 | 15 | 16 — which format was archived (§9.4.3.1)
+    ADD COLUMN metadata_hash       BYTEA,       -- integrity, and detects a spec served two ways
+    ADD COLUMN metadata_archived_at TIMESTAMPTZ;
+```
+
+All four are **nullable on purpose**. `NULL` is not missing data, it is a fact worth being
+able to query: *this runtime was indexed, but its metadata is not in the archive* — true of
+every row written before the store existed, and a precise answer to "which ranges can I
+actually replay?"
+
+```sql
+-- Ranges that will fail a replay, and why.
+SELECT chain_id, spec_version, first_seen_block
+FROM runtime_versions
+WHERE metadata_hash IS NULL
+ORDER BY chain_id, first_seen_block;
+```
+
 > [!IMPORTANT]
-> `first_block` is the block *after* the one carrying `set_code` — the first block the new
-> runtime actually executed. The upgrade block itself belongs to the **previous** row. Getting
-> this backwards reintroduces §9.1.2's defect in table form, where it is harder to see.
+> **`first_seen_block` is the block *after* the one carrying `set_code`** — the first block the
+> new runtime actually executed. The upgrade block itself belongs to the **previous** row.
+> Getting this backwards reintroduces §9.1.2's defect in table form, where it is much harder
+> to see.
+>
+> The existing writer already gets this right, and got it right *for free* from `543a56f`.
+> `write_block_in_tx` (`repo.rs:125`) inserts `(block.spec_version, block.number)` with
+> `ON CONFLICT DO NOTHING`, and since the fix `block.spec_version` is the **executing**
+> runtime. So the upgrade block re-asserts the old runtime's existing row and changes nothing,
+> and the new runtime's row is created by the *next* block. Had the fix not landed, this table
+> would have recorded every new runtime as starting one block too early.
+
+> [!NOTE]
+> `first_seen_block` is named honestly: it is the first block *this indexer saw* under that
+> runtime, which equals the runtime's true first block only when indexing ran from genesis in
+> order. With `start_block` set, or after a partial replay, it is a lower bound. That is
+> adequate for selecting metadata — the archive stores `spec_version` per block anyway
+> (§9.1) — but it is not a substitute for the per-block value, and nothing should treat it as
+> the authoritative block → runtime map.
 
 **Who does what:**
 
@@ -1306,7 +1348,8 @@ parses in tests and fails in the field.
 
 | File | Change |
 |---|---|
-| `migrations/0002_pipeline.sql` *(new)* | The three tables of §9.2, plus `runtime_upgrades` (§9.4.6). |
+| `migrations/0002_pipeline.sql` *(new)* | The three tables of §9.2, plus an `ALTER TABLE runtime_versions` adding the archive's metadata columns (§9.4.6) — **not** a second runtime table. |
+| `src/repo.rs:125` | `write_block_in_tx`'s `runtime_versions` upsert is unchanged and stays correct. The fetch stage fills the new columns separately, on first sight of a `spec_version`, since it is the half that holds the metadata bytes. |
 | `src/repo.rs:137-142` | `write_block_in_tx`'s per-row `for` loops become `UNNEST`-based multi-row inserts. **This is not optional** — a block with 200 events currently costs 200+ sequential round-trips inside the transaction, and parallel fetch buys nothing until it is fixed. |
 | `src/repo.rs` | New `write_blocks_in_tx(tx, &[BlockData])`, `load_watermarks`, `advance_fetch_watermark`, `advance_digest_watermark`, `advance_archive_watermark`, and the chunk-queue functions. |
 
